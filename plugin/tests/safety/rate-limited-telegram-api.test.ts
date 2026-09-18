@@ -963,6 +963,144 @@ describe('createRateLimitedTelegramApi — hermes pre-merge checks (2026-09-18)'
   })
 })
 
+describe('createRateLimitedTelegramApi — hermes static review of 4d9ba13', () => {
+  test('two in-flight requests returning different long 429s within 30 s: the longer window is saved at once and restored', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    stub.queueError('sendMessage', make429Error(30_710))
+    stub.queueError('sendMessage', make429Error(56_483))
+    await Promise.all([
+      api.sendMessage('A', 'a', {}).catch(() => {}),
+      api.sendMessage('B', 'b', {}).catch(() => {}),
+    ])
+    expect(stub.attempts('sendMessage')).toBe(2)
+    expect(store.saved.map((r) => r.until_ms)).toEqual([30_710_000, 56_483_000])
+    // "Restart": a fresh wrapper on the same store restores the LONGER window.
+    const events: RateLimitEvent[] = []
+    createRateLimitedTelegramApi(makeStubApi(clock).api, stubLog, {
+      ...defaultOpts(clock),
+      floodWaitStore: store,
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    expect(events[0]).toMatchObject({ kind: 'restored', retry_after_s: 56_483 })
+  })
+
+  test('a failed save lands on the retry timer even when no further request ever comes', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    store.failing = true
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'a', {}).catch(() => {})
+    expect(store.attempts.length).toBe(1)
+    store.failing = false
+    // No calls at all — only time passes.
+    await clock.tick(30_000)
+    expect(store.saved.length).toBe(1)
+    expect(store.saved[0]).toMatchObject({ until_ms: 30_710_000, method: 'sendMessage' })
+    // Nothing further is scheduled once persisted.
+    await clock.tick(60_000)
+    expect(store.attempts.length).toBe(2)
+  })
+
+  test('a longer window learned while a failed save is pending replaces it and is written immediately', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    // First save fails (disk hiccup), every later one succeeds.
+    const attempts: number[] = []
+    const flaky: FloodWaitStore = {
+      load: () => null,
+      save: (r) => {
+        attempts.push(r.until_ms)
+        return attempts.length === 1 ? false : store.save(r)
+      },
+    }
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: flaky })
+    // Two in-flight ops; the first fails to persist, the second is longer.
+    stub.queueError('sendMessage', make429Error(30_710))
+    stub.queueError('sendMessage', make429Error(56_483))
+    await Promise.all([
+      api.sendMessage('A', 'a', {}).catch(() => {}),
+      api.sendMessage('B', 'b', {}).catch(() => {}),
+    ])
+    expect(attempts).toEqual([30_710_000, 56_483_000])
+    expect(store.saved.map((r) => r.until_ms)).toEqual([56_483_000])
+  })
+
+  test('the suppressed tail is flushed when the breaker closes, with chat_id only for a single-chat aggregate', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    stub.queueError('sendMessage', make429Error(100))
+    await api.sendMessage('A', 'a', {}).catch(() => {})
+    // First suppressed reported at once (chat X), two more counted from X and Y.
+    await api.sendMessage('X', '1', {}).catch(() => {})
+    await api.sendMessage('X', '2', {}).catch(() => {})
+    await api.sendMessage('Y', '3', {}).catch(() => {})
+    // Same chat only, other method.
+    await api.sendChatAction('Z', 'typing').catch(() => {})
+    await api.sendChatAction('Z', 'typing').catch(() => {})
+    expect(events.filter((e) => e.kind === 'suppressed')).toEqual([
+      { kind: 'suppressed', method: 'sendMessage', chat_id: 'X', retry_after_s: 100, window_opens_at: new Date(100_000).toISOString(), count: 1 },
+      { kind: 'suppressed', method: 'sendChatAction', chat_id: 'Z', retry_after_s: 100, window_opens_at: new Date(100_000).toISOString(), count: 1 },
+    ])
+    // Window expires; the next call passes and flushes the tail first.
+    await clock.tick(100_000)
+    const sent = await api.sendMessage('A', 'after', {})
+    expect(sent.message_id).toBe(1)
+    const tail = events.filter((e) => e.kind === 'suppressed').slice(2)
+    expect(tail).toEqual([
+      { kind: 'suppressed', method: 'sendMessage', retry_after_s: 0, window_opens_at: new Date(100_000).toISOString(), count: 2 },
+      { kind: 'suppressed', method: 'sendChatAction', chat_id: 'Z', retry_after_s: 0, window_opens_at: new Date(100_000).toISOString(), count: 1 },
+    ])
+    // Nothing left over for a later window.
+    stub.queueError('sendMessage', make429Error(100))
+    await api.sendMessage('A', 'b', {}).catch(() => {})
+    await api.sendMessage('X', 'c', {}).catch(() => {})
+    const last = events[events.length - 1]
+    expect(last).toMatchObject({ kind: 'suppressed', method: 'sendMessage', chat_id: 'X', count: 1 })
+  })
+
+  test('an aggregate is closed when the window is extended by an in-flight response, so counts do not cross windows', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    // In-flight op started before any window exists.
+    let reject!: (e: unknown) => void
+    const inflight = api
+      .withFloodGuard('setMyCommands', () => new Promise<void>((_, r) => { reject = r }))
+      .catch(() => {})
+    await flushMicrotasks()
+    stub.queueError('sendMessage', make429Error(100))
+    await api.sendMessage('A', 'a', {}).catch(() => {})
+    await api.sendMessage('X', '1', {}).catch(() => {}) // reported
+    await api.sendMessage('X', '2', {}).catch(() => {}) // counted
+    // The in-flight op now returns a longer window.
+    reject(make429Error(500))
+    await inflight
+    // Next suppressed call: old aggregate (count 1, old window) flushed, new one started.
+    await api.sendMessage('X', '3', {}).catch(() => {})
+    const suppressed = events.filter((e) => e.kind === 'suppressed')
+    expect(suppressed).toEqual([
+      { kind: 'suppressed', method: 'sendMessage', chat_id: 'X', retry_after_s: 100, window_opens_at: new Date(100_000).toISOString(), count: 1 },
+      { kind: 'suppressed', method: 'sendMessage', chat_id: 'X', retry_after_s: 100, window_opens_at: new Date(100_000).toISOString(), count: 1 },
+      { kind: 'suppressed', method: 'sendMessage', chat_id: 'X', retry_after_s: 500, window_opens_at: new Date(500_000).toISOString(), count: 1 },
+    ])
+  })
+})
+
 describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real files', () => {
   test('save then load round-trips; missing and corrupt files read as null', () => {
     const dir = mkdtempSync(join(tmpdir(), 'floodwait-'))

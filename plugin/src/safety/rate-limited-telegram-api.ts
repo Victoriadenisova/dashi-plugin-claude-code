@@ -221,6 +221,16 @@ export interface RateLimitedTelegramApi extends TelegramApi {
   withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T>
 }
 
+// writeSync may write fewer bytes than asked; loop until the buffer is out.
+function writeAllSync(fd: number, buf: Buffer): void {
+  let off = 0
+  while (off < buf.length) {
+    const n = writeSync(fd, buf, off, buf.length - off)
+    if (n <= 0) throw new Error('short write')
+    off += n
+  }
+}
+
 // Warn about a failing file at most once per FS_WARN_INTERVAL_MS. A full or
 // read-only disk would otherwise turn every 429 into a warning line.
 function makeThrottledWarn(log: Logger, msg: string, path: string): (err: unknown) => void {
@@ -245,10 +255,11 @@ export interface FileFloodWaitStoreOptions {
 
 /**
  * File-backed FloodWaitStore. One small JSON file, written atomically
- * (tmp + fsync + rename) so a crash mid-write cannot leave a half record. A
- * missing or corrupt file reads as "no flood-wait known" — never as an
- * error, the channel must start regardless. Single writer by contract: the
- * channel holds bot.pid, so one process owns one state dir.
+ * (tmp + fsync + rename + directory fsync) so a crash mid-write cannot leave
+ * a half record and a completed save survives power loss, not just a process
+ * restart. A missing or corrupt file reads as "no flood-wait known" — never
+ * as an error, the channel must start regardless. Single writer by
+ * contract: the channel holds bot.pid, so one process owns one state dir.
  */
 export function createFileFloodWaitStore(
   path: string,
@@ -311,12 +322,25 @@ export function createFileFloodWaitStore(
         mkdirSync(dirname(path), { recursive: true })
         const fd = openSync(tmp, 'w', 0o600)
         try {
-          writeSync(fd, JSON.stringify(stamped) + '\n')
+          writeAllSync(fd, Buffer.from(JSON.stringify(stamped) + '\n'))
           fsyncSync(fd)
         } finally {
           closeSync(fd)
         }
         renameSync(tmp, path)
+        // The rename is durable only once the directory entry is flushed.
+        // Not every filesystem allows fsync on a directory fd; treat that as
+        // best-effort — the data file itself is already synced.
+        try {
+          const dfd = openSync(dirname(path), 'r')
+          try {
+            fsyncSync(dfd)
+          } finally {
+            closeSync(dfd)
+          }
+        } catch {
+          // ignore: directory fsync unsupported here
+        }
         return true
       } catch (err) {
         // Losing persistence is bad but must not turn a 429 into a crash.
@@ -469,32 +493,54 @@ export function createRateLimitedTelegramApi(
     }
   }
 
-  // Persistence is best-effort per attempt but not fire-and-forget: the
-  // window the store last acknowledged is tracked, and while memory is
-  // ahead of it (a save failed, or threw) the record stays dirty and is
-  // retried on the next 429-related event, at most once per
-  // PERSIST_RETRY_MS. In-memory state always advances regardless.
+  // Persistence is not fire-and-forget: the window the store last
+  // acknowledged is tracked, and while memory is ahead of it (a save failed,
+  // or threw) the record stays dirty. A NEW longer window is always written
+  // at once — two in-flight requests can return different long 429s within
+  // seconds and the longer one must win on disk too. Only RETRIES of a
+  // failed save are throttled to PERSIST_RETRY_MS, and a retry is also
+  // scheduled on a timer so the record lands even if no further request
+  // ever comes. In-memory state always advances regardless.
   let persistedUntilMs = 0
   let lastPersistAttemptMs = -Infinity
   let pendingRecord: FloodWaitRecord | null = null
-  function persist(record: FloodWaitRecord | null): void {
-    if (!store) return
-    if (record) pendingRecord = record
-    if (!pendingRecord || pendingRecord.until_ms <= persistedUntilMs) return
-    const t = now()
-    if (t - lastPersistAttemptMs < PERSIST_RETRY_MS) return
-    lastPersistAttemptMs = t
-    let ok = false
+  let retryScheduled = false
+  function trySave(record: FloodWaitRecord): boolean {
+    lastPersistAttemptMs = now()
     try {
-      ok = store.save(pendingRecord) === true
+      return store?.save(record) === true
     } catch (err) {
       log.warn('flood-wait store save threw', {
         error: err instanceof Error ? err.message : String(err),
       })
+      return false
     }
-    if (ok) {
+  }
+  function scheduleRetry(): void {
+    if (retryScheduled) return
+    retryScheduled = true
+    void sleep(PERSIST_RETRY_MS).then(() => {
+      retryScheduled = false
+      persist(null)
+    })
+  }
+  function persist(record: FloodWaitRecord | null): void {
+    if (!store) return
+    if (record) {
+      // Newest window supersedes whatever was still pending.
+      if (!pendingRecord || record.until_ms >= pendingRecord.until_ms) pendingRecord = record
+    }
+    if (!pendingRecord || pendingRecord.until_ms <= persistedUntilMs) {
+      pendingRecord = null
+      return
+    }
+    const isRetry = record === null
+    if (isRetry && now() - lastPersistAttemptMs < PERSIST_RETRY_MS) return
+    if (trySave(pendingRecord)) {
       persistedUntilMs = pendingRecord.until_ms
       pendingRecord = null
+    } else {
+      scheduleRetry()
     }
   }
 
@@ -531,26 +577,63 @@ export function createRateLimitedTelegramApi(
     }
   }
 
-  // Suppressed calls are coalesced per method: the first one in an interval
-  // is reported at once, the rest are counted and flushed with the next
-  // report. Keeps the journal readable when an agent retries in a loop.
-  const suppressedPending = new Map<string, { count: number; lastReportMs: number }>()
-  function reportSuppressed(method: string, chatId: string | undefined, retryAfterS: number, windowOpensAt: string): void {
-    const t = now()
-    const s = suppressedPending.get(method) ?? { count: 0, lastReportMs: -Infinity }
-    s.count += 1
-    if (t - s.lastReportMs >= SUPPRESSED_REPORT_INTERVAL_MS) {
-      log.warn('telegram flood-wait in force, request suppressed', {
-        method,
-        retry_after_s: retryAfterS,
-        window_opens_at: windowOpensAt,
-        count: s.count,
-      })
-      emit({ kind: 'suppressed', method, chat_id: chatId, retry_after_s: retryAfterS, window_opens_at: windowOpensAt, count: s.count })
-      s.count = 0
-      s.lastReportMs = t
+  // Suppressed calls are coalesced per method and per window: the first one
+  // in an interval is reported at once, the rest are counted and flushed
+  // with the next report, when the window they belong to changes, or when
+  // the breaker closes (first call that passes it). So no tail is lost and
+  // no count leaks into a later window. chat_id is reported only when every
+  // call in the aggregate came from the same chat.
+  interface SuppressedAgg {
+    count: number
+    lastReportMs: number
+    chatId: string | undefined
+    mixedChats: boolean
+    windowUntilMs: number
+  }
+  const suppressedPending = new Map<string, SuppressedAgg>()
+  function flushSuppressed(method: string, s: SuppressedAgg): void {
+    if (s.count === 0) return
+    const retryAfterS = Math.max(0, Math.ceil((s.windowUntilMs - now()) / 1000))
+    const windowOpensAt = new Date(s.windowUntilMs).toISOString()
+    const chatId = s.mixedChats ? undefined : s.chatId
+    log.warn('telegram flood-wait in force, request suppressed', {
+      method,
+      retry_after_s: retryAfterS,
+      window_opens_at: windowOpensAt,
+      count: s.count,
+    })
+    emit({
+      kind: 'suppressed',
+      method,
+      ...(chatId !== undefined ? { chat_id: chatId } : {}),
+      retry_after_s: retryAfterS,
+      window_opens_at: windowOpensAt,
+      count: s.count,
+    })
+    s.count = 0
+    s.chatId = undefined
+    s.mixedChats = false
+    s.lastReportMs = now()
+  }
+  function flushAllSuppressed(): void {
+    for (const [method, s] of suppressedPending) flushSuppressed(method, s)
+    suppressedPending.clear()
+  }
+  function reportSuppressed(method: string, chatId: string | undefined): void {
+    let s = suppressedPending.get(method)
+    if (s && s.windowUntilMs !== floodWaitUntilMs) {
+      // The window was extended: close the old aggregate first.
+      flushSuppressed(method, s)
+      s = undefined
     }
-    suppressedPending.set(method, s)
+    if (!s) {
+      s = { count: 0, lastReportMs: -Infinity, chatId: undefined, mixedChats: false, windowUntilMs: floodWaitUntilMs }
+      suppressedPending.set(method, s)
+    }
+    if (s.count === 0) s.chatId = chatId
+    else if (s.chatId !== chatId) s.mixedChats = true
+    s.count += 1
+    if (now() - s.lastReportMs >= SUPPRESSED_REPORT_INTERVAL_MS) flushSuppressed(method, s)
   }
 
   function getChatState(chatId: string): ChatState {
@@ -603,12 +686,13 @@ export function createRateLimitedTelegramApi(
       if (suppressedForMs > 0) {
         // Breaker open — do not touch the API, it would only re-arm the ban.
         const retryAfterS = Math.ceil(suppressedForMs / 1000)
-        const windowOpensAt = new Date(floodWaitUntilMs).toISOString()
-        reportSuppressed(method, chatId, retryAfterS, windowOpensAt)
+        reportSuppressed(method, chatId)
         // A window that never reached disk gets another chance here.
         persist(null)
         throw new TelegramFloodWaitError(method, retryAfterS, floodWaitUntilMs, lastErr)
       }
+      // Breaker closed: whatever was counted during the window goes out now.
+      if (suppressedPending.size > 0) flushAllSuppressed()
       try {
         return await op()
       } catch (err) {
