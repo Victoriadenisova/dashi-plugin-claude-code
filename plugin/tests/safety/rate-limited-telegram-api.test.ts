@@ -327,9 +327,47 @@ describe('createRateLimitedTelegramApi — global token bucket', () => {
     stub.queueError('answerGuestQuery', make429Error(1))
     const p = api.answerGuestQuery('gq', 'ответ', {})
     await flushMicrotasks()
-    await clock.tick(1200)
+    // Bucket bypass: the first attempt went out immediately (and got the 429)
+    // while the per-chat bucket for '100' is still empty.
+    expect(stub.attempts('answerGuestQuery')).toBe(1)
+    // retry_after is honoured: no second attempt before the full second.
+    await clock.tick(999)
+    expect(stub.attempts('answerGuestQuery')).toBe(1)
+    await clock.tick(1)
     await p
+    expect(stub.attempts('answerGuestQuery')).toBe(2)
     expect(stub.calls.filter((c) => c.method === 'answerGuestQuery').length).toBe(1)
+  })
+
+  // hermes static review of 7eb81c8: a rich send is one outbound bubble and
+  // must share the per-chat FIFO + bucket with plain sends; a rich edit
+  // targets an existing message and must NOT wait on that bucket.
+  test('rich send shares the per-chat FIFO and bucket; rich edit skips the bucket', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const opts = defaultOpts(clock)
+    opts.perChatBurstCapacity = 1
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
+    const p = Promise.all([
+      api.sendMessage('100', '1', {}),
+      api.sendRichMessage('100', '**2**', {}),
+      api.sendMessage('100', '3', {}),
+    ])
+    await flushMicrotasks()
+    expect(stub.calls.map((c) => c.method)).toEqual(['sendMessage'])
+    // Bucket empty, yet the rich edit goes straight through.
+    await api.editRichMessage('100', 1, '**e**')
+    expect(stub.calls.map((c) => c.method)).toEqual(['sendMessage', 'editRichMessage'])
+    await clock.tick(1000)
+    expect(stub.calls.map((c) => c.method)).toEqual(['sendMessage', 'editRichMessage', 'sendRichMessage'])
+    await clock.tick(1000)
+    await p
+    expect(stub.calls.map((c) => c.method)).toEqual([
+      'sendMessage',
+      'editRichMessage',
+      'sendRichMessage',
+      'sendMessage',
+    ])
   })
 
   // Opus merge review #7: a flood-wait earned by a rich send/edit must be
@@ -360,6 +398,55 @@ describe('createRateLimitedTelegramApi — global token bucket', () => {
     expect(events.filter((e) => e.kind === 'flood_wait').map((e) => e.method)).toEqual([
       'sendRichMessage',
       'editRichMessage',
+    ])
+  })
+
+  // hermes static review of 9bb38f4: the HUD pin/unpin adapters in server.ts
+  // are `withFloodGuard('pinChatMessage' | 'unpinChatMessage', () => bot.api.*)`.
+  // This pins down what that guard does for them: zero calls inside an open
+  // send window, a normal call once the window has passed, and their own
+  // long 429 opening the send breaker for everything else.
+  test('withFloodGuard for pin/unpin: silent inside the send window, live after it, own 429 opens the breaker', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    let pinCalls = 0
+    const pin = () =>
+      api.withFloodGuard('pinChatMessage', async () => {
+        pinCalls += 1
+      })
+    // 1. A plain send earns a 30 710 s ban → send window open.
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'x', {}).catch(() => {})
+    // 2. Pin inside the window: fails fast, never reaches the API.
+    const inside = await pin().catch((e: unknown) => e)
+    expect(inside).toBeInstanceOf(TelegramFloodWaitError)
+    expect(pinCalls).toBe(0)
+    // 3. Window passed: the very same adapter call goes through.
+    await clock.tick(30_711 * 1000)
+    await pin()
+    expect(pinCalls).toBe(1)
+    // 4. Unpin earns its own long 429: journalled under its name, send
+    //    breaker open again → a plain send is suppressed with zero attempts.
+    let unpinCalls = 0
+    const unpinErr = await api
+      .withFloodGuard('unpinChatMessage', async () => {
+        unpinCalls += 1
+        throw make429Error(30_710)
+      })
+      .catch((e: unknown) => e)
+    expect(unpinErr).toBeInstanceOf(TelegramFloodWaitError)
+    expect(unpinCalls).toBe(1)
+    const send = await api.sendMessage('100', 'y', {}).catch((e: unknown) => e)
+    expect(send).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('sendMessage')).toBe(1)
+    expect(events.filter((e) => e.kind === 'flood_wait').map((e) => e.method)).toEqual([
+      'sendMessage',
+      'unpinChatMessage',
     ])
   })
 })
