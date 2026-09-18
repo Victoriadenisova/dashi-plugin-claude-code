@@ -37,7 +37,11 @@ import {
   type ToolDeps,
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
-import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import {
+  createFileFloodWaitStore,
+  createJsonlRateLimitEventSink,
+  createRateLimitedTelegramApi,
+} from './safety/rate-limited-telegram-api.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
@@ -420,7 +424,18 @@ const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
 // queued op gets logged; no time wasted enqueueing text that would later be
 // downgraded). A burst of replies now paces itself instead of surfacing as
 // a 429 to the agent.
-const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
+// Flood-wait state and the 429 journal live under the channel's state root:
+// the breaker window survives a restart (a restart inside the window used
+// to forget the ban and re-arm it with the first reply), and every 429 is
+// written with its Telegram method so the call that earned a ban can be
+// found instead of guessed.
+const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log, {
+  floodWaitStore: createFileFloodWaitStore(join(statePaths.root, 'flood-wait.json'), log),
+  onRateLimitEvent: createJsonlRateLimitEventSink(
+    join(statePaths.root, 'logs', 'telegram-429.jsonl'),
+    log,
+  ),
+})
 // The bot token itself is included in extraSecrets so any code path that
 // accidentally tries to ship the token (e.g. error message including a
 // URL-with-token from grammy) gets it scrubbed before the bytes leave us.
@@ -1196,8 +1211,12 @@ poller = new TelegramPoller({
 // (no internet, token revoked) must not block the poller from starting.
 void (async () => {
   try {
-    await bot.api.setMyCommands(
-      BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description })),
+    // Through the flood-wait breaker: a bare bot.api call here would hit
+    // Telegram inside a ban window on every restart and re-arm it.
+    await rateLimitedTelegramApi.withFloodGuard('setMyCommands', () =>
+      bot.api.setMyCommands(
+        BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description })),
+      ),
     )
     log.info('telegram commands registered', { count: BOT_COMMANDS.length })
   } catch (err) {

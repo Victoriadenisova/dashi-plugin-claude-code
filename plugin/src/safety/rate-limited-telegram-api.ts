@@ -21,7 +21,17 @@
 //      real window. See MAX_RETRY_AFTER_S for why retrying makes it worse.
 //   4. Flood-wait breaker: after a long wait is seen, every call is
 //      rejected locally until the window expires, so no request can re-arm
-//      the ban. See `floodWaitUntilMs`.
+//      the ban. See `floodWaitUntilMs`. The window is persisted through
+//      `opts.floodWaitStore` so a process restart inside it does not forget
+//      the ban and re-arm it with the first reply (Louis, 2026-09-18: 56483 s).
+//   5. Every 429 (burst retry, flood-wait, local suppression) is reported
+//      through `opts.onRateLimitEvent` with the Telegram METHOD name, so the
+//      first call that earned a ban can be found afterwards instead of
+//      guessed. server.ts wires this to logs/telegram-429.jsonl.
+//
+// Calls that are not part of TelegramApi (e.g. `setMyCommands` at startup)
+// go through `withFloodGuard(method, op)` on the returned object so they get
+// the same breaker + 429 handling instead of bypassing it.
 //
 // Methods that don't consume the send-bucket: editMessageText (Telegram's
 // edit limits are far more lenient), setMessageReaction, sendChatAction,
@@ -32,6 +42,8 @@
 // setTimeout-based sleep, so tests can run instantly with deterministic
 // virtual time.
 
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { dirname } from 'path'
 import type { Logger } from '../log.js'
 import type {
   ChatAction,
@@ -103,6 +115,158 @@ export interface RateLimitOptions {
   now?: () => number
   /** Test seam: replace setTimeout-based sleep. */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * Persists the flood-wait window across restarts. Loaded once at
+   * construction; saved whenever a new (or longer) window is learned.
+   * Omit for an in-memory breaker only (tests, ad-hoc tooling).
+   */
+  floodWaitStore?: FloodWaitStore
+  /** Receives one event per 429-related decision. Must not throw. */
+  onRateLimitEvent?: (event: RateLimitEvent) => void
+}
+
+/** What we remember about a flood-wait: enough to restore the breaker and to
+ *  say afterwards which call earned it. */
+export interface FloodWaitRecord {
+  /** Epoch ms when the window closes. */
+  until_ms: number
+  /** Telegram method whose 429 opened (or extended) the window. */
+  method: string
+  retry_after_s: number
+  /** ISO timestamp of the 429. */
+  seen_at: string
+}
+
+export interface FloodWaitStore {
+  /** Returns the last saved record, or null when none / unreadable. */
+  load(): FloodWaitRecord | null
+  save(record: FloodWaitRecord): void
+}
+
+export type RateLimitEvent =
+  | {
+      kind: 'burst_retry'
+      method: string
+      chat_id?: string | undefined
+      retry_after_s: number
+      attempt: number
+      wait_ms: number
+    }
+  | {
+      kind: 'flood_wait'
+      method: string
+      chat_id?: string | undefined
+      retry_after_s: number
+      attempt: number
+      window_opens_at: string
+    }
+  | {
+      kind: 'suppressed'
+      method: string
+      chat_id?: string | undefined
+      retry_after_s: number
+      window_opens_at: string
+    }
+  | {
+      kind: 'restored'
+      method: string
+      retry_after_s: number
+      window_opens_at: string
+    }
+
+export interface RateLimitedTelegramApi extends TelegramApi {
+  /**
+   * Run an arbitrary Bot API call under the flood-wait breaker and the 429
+   * retry policy, without the per-chat send bucket. For calls that are not
+   * on TelegramApi (startup `setMyCommands`, future one-offs). `method` is
+   * the Telegram method name and ends up in the 429 log.
+   */
+  withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T>
+}
+
+/**
+ * File-backed FloodWaitStore. One small JSON file, written atomically
+ * (tmp + rename) so a crash mid-write cannot leave a half record. A missing
+ * or corrupt file reads as "no flood-wait known" — never as an error, the
+ * channel must start regardless.
+ */
+export function createFileFloodWaitStore(path: string, log: Logger): FloodWaitStore {
+  return {
+    load(): FloodWaitRecord | null {
+      let raw: string
+      try {
+        raw = readFileSync(path, 'utf8')
+      } catch {
+        return null
+      }
+      try {
+        const v = JSON.parse(raw) as Partial<FloodWaitRecord>
+        if (
+          typeof v !== 'object' ||
+          v === null ||
+          typeof v.until_ms !== 'number' ||
+          !Number.isFinite(v.until_ms) ||
+          typeof v.method !== 'string'
+        ) {
+          log.warn('flood-wait state file malformed, ignoring', { path })
+          return null
+        }
+        return {
+          until_ms: v.until_ms,
+          method: v.method,
+          retry_after_s: typeof v.retry_after_s === 'number' ? v.retry_after_s : 0,
+          seen_at: typeof v.seen_at === 'string' ? v.seen_at : '',
+        }
+      } catch (err) {
+        log.warn('flood-wait state file unreadable, ignoring', {
+          path,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return null
+      }
+    },
+    save(record: FloodWaitRecord): void {
+      try {
+        mkdirSync(dirname(path), { recursive: true })
+        const tmp = `${path}.tmp-${process.pid}`
+        writeFileSync(tmp, JSON.stringify(record) + '\n', { mode: 0o600 })
+        renameSync(tmp, path)
+      } catch (err) {
+        // Losing persistence is bad but must not turn a 429 into a crash.
+        log.warn('flood-wait state file write failed', {
+          path,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    },
+  }
+}
+
+/**
+ * JSONL sink for RateLimitEvent: one line per event, `ts` first. Append-only
+ * so a ban can be traced back to the exact method and time afterwards.
+ */
+export function createJsonlRateLimitEventSink(
+  path: string,
+  log: Logger,
+): (event: RateLimitEvent) => void {
+  let dirReady = false
+  return (event: RateLimitEvent): void => {
+    try {
+      if (!dirReady) {
+        mkdirSync(dirname(path), { recursive: true })
+        dirReady = true
+      }
+      appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n', {
+        mode: 0o600,
+      })
+    } catch (err) {
+      log.warn('telegram 429 log write failed', {
+        path,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
 }
 
 interface Grammy429 {
@@ -173,7 +337,7 @@ export function createRateLimitedTelegramApi(
   raw: TelegramApi,
   log: Logger,
   opts: RateLimitOptions = {},
-): TelegramApi {
+): RateLimitedTelegramApi {
   const cfg = {
     perChatRefillPerSec: opts.perChatRefillPerSec ?? 1,
     perChatBurstCapacity: opts.perChatBurstCapacity ?? 3,
@@ -200,6 +364,40 @@ export function createRateLimitedTelegramApi(
   // and reject locally instead. That silence is what lets the ban run out.
   // 0 = no flood-wait known.
   let floodWaitUntilMs = 0
+  const store = opts.floodWaitStore
+  const emit = (event: RateLimitEvent): void => {
+    try {
+      opts.onRateLimitEvent?.(event)
+    } catch (err) {
+      log.warn('rate-limit event sink threw', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  // Restore a window that outlived the previous process. Without this a
+  // restart inside the ban forgets it, and the very next reply re-arms the
+  // full window. An expired record is ignored (and left on disk; the next
+  // flood-wait overwrites it).
+  if (store) {
+    const saved = store.load()
+    if (saved && saved.until_ms > now()) {
+      floodWaitUntilMs = saved.until_ms
+      const remainingS = Math.ceil((saved.until_ms - now()) / 1000)
+      log.warn('telegram flood-wait restored from state, suppressing sends', {
+        method: saved.method,
+        retry_after_s: remainingS,
+        window_opens_at: new Date(saved.until_ms).toISOString(),
+        seen_at: saved.seen_at,
+      })
+      emit({
+        kind: 'restored',
+        method: saved.method,
+        retry_after_s: remainingS,
+        window_opens_at: new Date(saved.until_ms).toISOString(),
+      })
+    }
+  }
 
   function getChatState(chatId: string): ChatState {
     let s = chatState.get(chatId)
@@ -238,7 +436,11 @@ export function createRateLimitedTelegramApi(
   // `maxRetries` is the MAX NUMBER OF ATTEMPTS including the initial call.
   // Semantically: budget of how many times we hit Telegram for this op.
   // maxRetries=3 → up to 3 attempts (2 retries after the first failure).
-  async function withRetry<T>(method: string, op: () => Promise<T>): Promise<T> {
+  async function withRetry<T>(
+    method: string,
+    op: () => Promise<T>,
+    chatId?: string,
+  ): Promise<T> {
     let attempt = 0
     let lastErr: unknown
     while (true) {
@@ -247,11 +449,13 @@ export function createRateLimitedTelegramApi(
       if (suppressedForMs > 0) {
         // Breaker open — do not touch the API, it would only re-arm the ban.
         const retryAfterS = Math.ceil(suppressedForMs / 1000)
+        const windowOpensAt = new Date(floodWaitUntilMs).toISOString()
         log.warn('telegram flood-wait in force, request suppressed', {
           method,
           retry_after_s: retryAfterS,
-          window_opens_at: new Date(floodWaitUntilMs).toISOString(),
+          window_opens_at: windowOpensAt,
         })
+        emit({ kind: 'suppressed', method, chat_id: chatId, retry_after_s: retryAfterS, window_opens_at: windowOpensAt })
         throw new TelegramFloodWaitError(method, retryAfterS, floodWaitUntilMs, lastErr)
       }
       try {
@@ -265,13 +469,24 @@ export function createRateLimitedTelegramApi(
           // open the breaker so nothing else re-arms it. Never shorten a
           // window we already know about.
           const windowOpensAtMs = now() + r.retryAfter * 1000
+          const extended = windowOpensAtMs > floodWaitUntilMs
           floodWaitUntilMs = Math.max(floodWaitUntilMs, windowOpensAtMs)
+          const windowOpensAt = new Date(windowOpensAtMs).toISOString()
           log.warn('telegram flood-wait, not retrying', {
             method,
             retry_after_s: r.retryAfter,
             attempt,
-            window_opens_at: new Date(windowOpensAtMs).toISOString(),
+            window_opens_at: windowOpensAt,
           })
+          emit({ kind: 'flood_wait', method, chat_id: chatId, retry_after_s: r.retryAfter, attempt, window_opens_at: windowOpensAt })
+          if (extended && store) {
+            store.save({
+              until_ms: floodWaitUntilMs,
+              method,
+              retry_after_s: r.retryAfter,
+              seen_at: new Date(now()).toISOString(),
+            })
+          }
           throw new TelegramFloodWaitError(method, r.retryAfter, floodWaitUntilMs, err)
         }
         if (attempt >= cfg.maxRetries) break
@@ -284,6 +499,7 @@ export function createRateLimitedTelegramApi(
           attempt,
           wait_ms: waitTotalMs,
         })
+        emit({ kind: 'burst_retry', method, chat_id: chatId, retry_after_s: r.retryAfter, attempt, wait_ms: waitTotalMs })
         await sleep(waitTotalMs)
       }
     }
@@ -292,7 +508,11 @@ export function createRateLimitedTelegramApi(
 
   // Serialize per-chat outbound work: each new op awaits the previous op
   // (without inheriting its error), then runs under the rate-limit gate.
-  async function enqueueSend<T>(chatId: string, op: () => Promise<T>): Promise<T> {
+  async function enqueueSend<T>(
+    chatId: string,
+    method: string,
+    op: () => Promise<T>,
+  ): Promise<T> {
     const state = getChatState(chatId)
     const prev = state.tail
     let release!: () => void
@@ -302,7 +522,7 @@ export function createRateLimitedTelegramApi(
     try {
       await prev.catch(() => {})
       await waitForCapacity(state)
-      return await withRetry('send', op)
+      return await withRetry(method, op, chatId)
     } finally {
       release()
     }
@@ -314,7 +534,7 @@ export function createRateLimitedTelegramApi(
       text: string,
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
-      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, sendOpts))
+      return enqueueSend(chatId, 'sendMessage', () => raw.sendMessage(chatId, text, sendOpts))
     },
 
     async editMessageText(
@@ -323,8 +543,10 @@ export function createRateLimitedTelegramApi(
       text: string,
       editOpts: EditOpts,
     ): Promise<void> {
-      return withRetry('editMessageText', () =>
-        raw.editMessageText(chatId, messageId, text, editOpts),
+      return withRetry(
+        'editMessageText',
+        () => raw.editMessageText(chatId, messageId, text, editOpts),
+        chatId,
       )
     },
 
@@ -333,13 +555,15 @@ export function createRateLimitedTelegramApi(
       messageId: number,
       emoji: string,
     ): Promise<void> {
-      return withRetry('setMessageReaction', () =>
-        raw.setMessageReaction(chatId, messageId, emoji),
+      return withRetry(
+        'setMessageReaction',
+        () => raw.setMessageReaction(chatId, messageId, emoji),
+        chatId,
       )
     },
 
     async sendChatAction(chatId: string, action: ChatAction): Promise<void> {
-      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action))
+      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action), chatId)
     },
 
     async sendDocument(
@@ -347,7 +571,7 @@ export function createRateLimitedTelegramApi(
       filePath: string,
       docOpts: SendDocumentOpts,
     ): Promise<{ message_id: number }> {
-      return enqueueSend(chatId, () => raw.sendDocument(chatId, filePath, docOpts))
+      return enqueueSend(chatId, 'sendDocument', () => raw.sendDocument(chatId, filePath, docOpts))
     },
 
     async sendPhoto(
@@ -355,7 +579,7 @@ export function createRateLimitedTelegramApi(
       filePath: string,
       photoOpts: SendDocumentOpts,
     ): Promise<{ message_id: number }> {
-      return enqueueSend(chatId, () => raw.sendPhoto(chatId, filePath, photoOpts))
+      return enqueueSend(chatId, 'sendPhoto', () => raw.sendPhoto(chatId, filePath, photoOpts))
     },
 
     async downloadFile(fileId: string, destDir: string): Promise<DownloadResult> {
@@ -363,7 +587,11 @@ export function createRateLimitedTelegramApi(
     },
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {
-      return withRetry('deleteMessage', () => raw.deleteMessage(chatId, messageId))
+      return withRetry('deleteMessage', () => raw.deleteMessage(chatId, messageId), chatId)
+    },
+
+    async withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T> {
+      return withRetry(method, op)
     },
   }
 }
