@@ -42,6 +42,8 @@ interface SentCall {
     | 'deleteMessage'
     | 'downloadFile'
     | 'answerGuestQuery'
+    | 'sendRichMessage'
+    | 'editRichMessage'
   chatId?: string
   messageId?: number
   text?: string
@@ -125,13 +127,18 @@ function makeStubApi(clock: FakeClock): StubApi {
       calls.push({ method: 'sendMessage', chatId, text, opts, ts: clock.now() })
       return { message_id: calls.length }
     },
-    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+    async sendRichMessage(chatId, _rawMarkdown, _opts) {
       // Pass-through stub; the rich path's own coverage lives in
       // tests/safety/rich-path.test.ts. Routes through the same enqueue here.
-      maybeThrow('sendMessage')
-      return { message_id: calls.length + 1 }
+      maybeThrow('sendRichMessage')
+      calls.push({ method: 'sendRichMessage', chatId, ts: clock.now() })
+      return { message_id: calls.length }
     },
-    async editRichMessage() { return { fallback: true } as const },
+    async editRichMessage(chatId, messageId) {
+      maybeThrow('editRichMessage')
+      calls.push({ method: 'editRichMessage', chatId, messageId, ts: clock.now() })
+      return { fallback: true } as const
+    },
     async editMessageText(chatId, messageId, text, opts) {
       maybeThrow('editMessageText')
       calls.push({ method: 'editMessageText', chatId, messageId, text, opts, ts: clock.now() })
@@ -323,6 +330,37 @@ describe('createRateLimitedTelegramApi — global token bucket', () => {
     await clock.tick(1200)
     await p
     expect(stub.calls.filter((c) => c.method === 'answerGuestQuery').length).toBe(1)
+  })
+
+  // Opus merge review #7: a flood-wait earned by a rich send/edit must be
+  // journalled under the rich method, not as a plain sendMessage /
+  // editMessageText — otherwise the journal this branch added points at the
+  // wrong caller. Both still share the send breaker: a rich ban suppresses
+  // plain sends and vice versa.
+  test('rich send and rich edit are journalled under their own method names', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    stub.queueError('sendRichMessage', make429Error(30_710))
+    const rich = await api.sendRichMessage('100', '**x**', {}).catch((e: unknown) => e)
+    expect(rich).toBeInstanceOf(TelegramFloodWaitError)
+    expect((rich as TelegramFloodWaitError).message).toContain('flood-wait on sendRichMessage')
+    // Shared send breaker: a plain edit is now suppressed too.
+    const edit = await api.editMessageText('100', 1, 'y', {}).catch((e: unknown) => e)
+    expect(edit).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('editMessageText')).toBe(0)
+    await clock.tick(30_711 * 1000)
+    stub.queueError('editRichMessage', make429Error(30_710))
+    const richEdit = await api.editRichMessage('100', 1, '**z**').catch((e: unknown) => e)
+    expect(richEdit).toBeInstanceOf(TelegramFloodWaitError)
+    expect(events.filter((e) => e.kind === 'flood_wait').map((e) => e.method)).toEqual([
+      'sendRichMessage',
+      'editRichMessage',
+    ])
   })
 })
 

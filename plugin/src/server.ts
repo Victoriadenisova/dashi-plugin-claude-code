@@ -557,8 +557,10 @@ const sessionInfoStore = new SessionInfoStore()
 //
 // The HUD's text sends/edits go through the SAME safe-wrapped, rate-limited
 // telegramApi as every other outbound call (redaction + HTML validation). Pin
-// carries no user text, so it is adapted straight from grammY here at the
-// composition root (mirrors registerOwnerScopedCommands' bot.api.* adapters).
+// carries no user text, so it is adapted from grammY here at the composition
+// root — under the flood-wait guard, like registerOwnerScopedCommands' bot.api.*
+// adapters: a pin/unpin inside an open flood-wait window must not hit the API
+// and re-arm the ban.
 // Every HUD op is best-effort inside ContextHud — a broken HUD never breaks
 // message delivery.
 // FIX-8 (both reviews): owner chats come from resolveOwnerChatIds (owner_chat_ids
@@ -576,12 +578,17 @@ const hudApi: HudTelegramApi = {
   editMessageText: (chatId, messageId, text, opts) =>
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
-    bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
+    rateLimitedTelegramApi
+      .withFloodGuard('pinChatMessage', () => bot.api.pinChatMessage(chatId, messageId, opts))
+      .then(() => undefined),
   // bump() legs (status pin): delete goes through the safe wrapper (rate
-  // limiting); unpin carries no user text and is adapted from grammY like pin.
+  // limiting); unpin carries no user text and is adapted from grammY like pin,
+  // under the same flood-wait guard.
   deleteMessage: (chatId, messageId) => telegramApi.deleteMessage(chatId, messageId),
   unpinChatMessage: (chatId, messageId) =>
-    bot.api.unpinChatMessage(chatId, messageId).then(() => undefined),
+    rateLimitedTelegramApi
+      .withFloodGuard('unpinChatMessage', () => bot.api.unpinChatMessage(chatId, messageId))
+      .then(() => undefined),
 }
 // The hosting Claude Code process's `--model` flag, read ONCE at boot. It is
 // the only place the `[1m]` window marker survives for models the API reports

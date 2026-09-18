@@ -68,6 +68,7 @@ import type {
   ChatAction,
   DownloadResult,
   EditOpts,
+  EditRichMessageResult,
   SendDocumentOpts,
   SendMessageOpts,
   SendRichMessageOpts,
@@ -842,12 +843,14 @@ export function createRateLimitedTelegramApi(
       chatId: string,
       messageId: number,
       rawMarkdown: string,
-    ) {
+    ): Promise<EditRichMessageResult> {
       // Edits target a message already on screen — they do not create a new
       // one, so they do not go through the per-chat send queue. Same path as
-      // editMessageText: send breaker + 429 retry, no bucket.
+      // editMessageText: send breaker + 429 retry, no bucket. Journalled
+      // under its own name so a 429 earned by a rich edit is attributed to
+      // it, not to a plain edit.
       return withRetry(
-        'editMessageText',
+        'editRichMessage',
         () => raw.editRichMessage(chatId, messageId, rawMarkdown),
         chatId,
       )
@@ -858,7 +861,7 @@ export function createRateLimitedTelegramApi(
       rawMarkdown: string,
       richOpts: SendRichMessageOpts,
     ): Promise<SendRichMessageResult> {
-      return enqueueSend(chatId, 'sendMessage', () =>
+      return enqueueSend(chatId, 'sendRichMessage', () =>
         raw.sendRichMessage(chatId, rawMarkdown, richOpts),
       )
     },
