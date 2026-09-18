@@ -95,6 +95,7 @@ function makeStatePaths(): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
@@ -139,6 +140,8 @@ function makeTelegramApi(): TelegramApi {
   }
   return {
     sendMessage: (async () => ({ message_id: 1 })) as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: async () => undefined,
     sendChatAction: async () => undefined,
@@ -146,6 +149,7 @@ function makeTelegramApi(): TelegramApi {
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
   }
 }
 

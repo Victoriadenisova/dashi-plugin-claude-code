@@ -22,7 +22,21 @@ export const ReplyArgsSchema = z.object({
   // text without markdown markers passes through unchanged. Pass 'text'
   // explicitly only when the caller needs a literal `<` / `>` / `&` in
   // the body (rare). Inspired by openclaw/extensions/telegram (MIT).
-  format: z.enum(['text', 'markdownv2', 'html']).default('html'),
+  //
+  // 'rich' (M1, Bot API 10.1): ship RAW markdown that Telegram renders
+  // server-side (tables/math/headings/task-lists/<details>/footnotes). It is
+  // NOT required to request it — when `richMessages.enabled` is on, an 'html'
+  // (the default) reply to a DM is auto-upgraded to rich with a transparent
+  // HTML fallback. The explicit 'rich' value is reserved for forcing the rich
+  // attempt; behaviourally it joins the same auto-upgrade gate as 'html'.
+  format: z.enum(['text', 'markdownv2', 'html', 'rich']).default('html'),
+  // Guest Mode: when the inbound <channel> meta carried guest_query_id,
+  // pass it back here — the reply is delivered via answerGuestQuery into
+  // the chat where the bot was @-mentioned (the bot is NOT a member of
+  // that chat, so chat_id-based sendMessage cannot reach it). One-shot:
+  // Telegram accepts exactly one answer per guest query. Attachments and
+  // reply_to are unsupported on this path and rejected loudly.
+  guest_query_id: z.string().min(1).optional(),
 })
 export type ReplyArgs = z.infer<typeof ReplyArgsSchema>
 
@@ -84,6 +98,13 @@ export type PermissionRequestRoute = z.infer<typeof PermissionRequestRouteSchema
 export const DownloadAttachmentArgsSchema = z.object({
   chat_id: z.string().min(1),
   file_id: z.string().min(1),
+  // Guest Mode: when the inbound <channel> meta carried guest_query_id, pass
+  // it back here to authorize a download from the FOREIGN chat the bot was
+  // @-mentioned in. The chat allowlist cannot authorize that chat (the bot is
+  // not a member), so authorization is registry membership — mirrors
+  // ReplyArgsSchema.guest_query_id. Non-consuming: several attachments may be
+  // fetched before the single guest reply.
+  guest_query_id: z.string().min(1).optional(),
 })
 export type DownloadAttachmentArgs = z.infer<typeof DownloadAttachmentArgsSchema>
 
@@ -109,6 +130,41 @@ export const StatusArgsSchema = z.object({
   reason: z.string().optional(),
 })
 export type StatusArgs = z.infer<typeof StatusArgsSchema>
+
+// Tool args - autonomy (PR-1, 2026-07-10). A READ + resolve surface over the
+// per-chat autonomy registry (leases + open questions). It can NEVER grant a
+// lease — granting arrives in PR-2 via the authenticated button relay.
+//   status            → compact human-readable dump of active leases + open Qs.
+//   consume           → mark a lease consumed (requires lease_id).
+//   revoke            → withdraw a lease's authority (requires lease_id,
+//                       optional reason; revokedBy='agent'). Self-revoke only
+//                       SHRINKS authority, so the tool may do it — it still
+//                       can never GRANT.
+//   resolve_question  → set a question answered/bypassed (requires question_id
+//                       + resolution).
+export const AutonomyArgsSchema = z
+  .object({
+    chat_id: z.union([z.number(), z.string()]).transform((v) => String(v)),
+    action: z.enum(['status', 'consume', 'revoke', 'resolve_question']),
+    lease_id: z.string().min(1).optional(),
+    question_id: z.string().min(1).optional(),
+    resolution: z.enum(['answered', 'bypassed']).optional(),
+    reason: z.string().min(1).max(1000).optional(),
+  })
+  .superRefine((a, ctx) => {
+    if ((a.action === 'consume' || a.action === 'revoke') && a.lease_id === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `action="${a.action}" requires lease_id`, path: ['lease_id'] })
+    }
+    if (a.action === 'resolve_question') {
+      if (a.question_id === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'action="resolve_question" requires question_id', path: ['question_id'] })
+      }
+      if (a.resolution === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'action="resolve_question" requires resolution', path: ['resolution'] })
+      }
+    }
+  })
+export type AutonomyArgs = z.infer<typeof AutonomyArgsSchema>
 
 // Webhook payload for /hooks/agent — message variant.
 // Today's `/hooks/agent` callers post `{ message, chatId, agentId? }` and the
@@ -223,6 +279,10 @@ export const ClaudeStopSchema = z
     ...ClaudeHookCommonShape,
     hook_event_name: z.literal('Stop'),
     effort: z.unknown().optional(),
+    // Stop carries the model of the turn that just ended, so a mid-session model
+    // switch (e.g. Opus → Fable) is observable at turn boundaries and the
+    // context HUD can follow the window. Optional — older harness builds omit it.
+    model: z.string().optional(),
   })
   .passthrough()
 
@@ -246,12 +306,27 @@ export const ClaudeSessionStartSchema = z
   })
   .passthrough()
 
+// SessionEnd is a REAL Claude Code hook event (unlike Stop, which is turn-end).
+// It fires once when the session actually terminates (clear / logout /
+// prompt_input_exit / other). The task surfaces (TaskMirror, context HUD)
+// finalize on THIS event, never on Stop. `reason` is an open string because
+// the harness may add reasons across versions; passthrough keeps unknown
+// fields riding through.
+export const ClaudeSessionEndSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('SessionEnd'),
+    reason: z.string().optional(),
+  })
+  .passthrough()
+
 export const ClaudeHookPayloadSchema = z.discriminatedUnion('hook_event_name', [
   ClaudePreToolUseSchema,
   ClaudePostToolUseSchema,
   ClaudeStopSchema,
   ClaudeUserPromptSubmitSchema,
   ClaudeSessionStartSchema,
+  ClaudeSessionEndSchema,
 ])
 export type ClaudeHookPayload = z.infer<typeof ClaudeHookPayloadSchema>
 
@@ -311,6 +386,10 @@ export const TelegramUpdateSchema = z
     channel_post: z.unknown().optional(),
     edited_channel_post: z.unknown().optional(),
     callback_query: z.unknown().optional(),
+    // Guest Mode (Bot API 10.0): one-shot @-mention from a chat the bot is
+    // not a member of. Payload is a Message with guest_query_id +
+    // guest_bot_caller_user/chat; handler validates the fields it reads.
+    guest_message: z.unknown().optional(),
   })
   .passthrough()
 export type TelegramUpdate = z.infer<typeof TelegramUpdateSchema>

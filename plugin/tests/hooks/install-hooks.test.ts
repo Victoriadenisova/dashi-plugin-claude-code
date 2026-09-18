@@ -53,14 +53,18 @@ function runInstall(extraArgs: string[] = []): { code: number; stderr: string } 
 }
 
 describe('install-hooks.sh — fresh settings file', () => {
-  test('creates hooks for all five events', () => {
+  test('creates hooks for the narrow feeder set (no `.*` PreToolUse feeder)', () => {
     const r = runInstall()
     expect(r.code).toBe(0)
     const parsed = readJson()
     const flat = JSON.stringify(parsed)
-    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']) {
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'SessionEnd', 'Stop']) {
       expect(flat).toContain(ev)
     }
+    // PreToolUse no longer carries a notification feeder (only the opt-in
+    // permission gate would land there — not enabled in this run).
+    const hooks = (parsed as { hooks?: Record<string, unknown> }).hooks ?? {}
+    expect(hooks.PreToolUse).toBeUndefined()
     expect(flat).toContain(POST_HOOK)
     expect(flat).toContain("TELEGRAM_HOOK_CHAT_ID='164795011'")
     expect(flat).toContain("TELEGRAM_HOOK_AGENT_ID='dashi-channel'")
@@ -72,14 +76,18 @@ describe('install-hooks.sh — fresh settings file', () => {
     expect(raw).not.toContain('TELEGRAM_WEBHOOK_TOKEN')
   })
 
-  test('matchers present on PreToolUse and PostToolUse only', () => {
+  test('PostToolUse feeder is scoped to the task tools; other events unmatched', () => {
     runInstall()
     const parsed = readJson() as {
       hooks?: Record<string, Array<{ matcher?: string }>>
     }
-    expect(parsed.hooks?.PreToolUse?.[0]?.matcher).toBe('.*')
-    expect(parsed.hooks?.PostToolUse?.[0]?.matcher).toBe('.*')
+    // Narrow matcher — `|`-separated exact tool names keeps the feeder off the
+    // hot path (Bash/Read/Edit no longer spawn it).
+    expect(parsed.hooks?.PostToolUse?.[0]?.matcher).toBe('TaskCreate|TaskUpdate|TodoWrite')
+    // No PreToolUse feeder at all in a gate-less install.
+    expect(parsed.hooks?.PreToolUse).toBeUndefined()
     expect(parsed.hooks?.SessionStart?.[0]?.matcher).toBeUndefined()
+    expect(parsed.hooks?.SessionEnd?.[0]?.matcher).toBeUndefined()
     expect(parsed.hooks?.Stop?.[0]?.matcher).toBeUndefined()
   })
 })
@@ -148,16 +156,23 @@ describe('install-hooks.sh — idempotency', () => {
     )
     runInstall()
     const parsed = readJson() as Record<string, unknown> & {
-      hooks?: { PreToolUse?: Array<{ marker?: string; hooks?: Array<{ command?: string }> }> }
+      hooks?: {
+        PreToolUse?: Array<{ marker?: string; hooks?: Array<{ command?: string }> }>
+        Stop?: Array<{ marker?: string }>
+      }
     }
     expect(parsed.otherKey).toEqual({ keep: 'me' })
-    // Other plugin's entry must survive.
+    // Other plugin's entry must survive — and since PreToolUse no longer carries
+    // our feeder, it survives ALONE on PreToolUse.
     const preToolUse = parsed.hooks?.PreToolUse ?? []
     const others = preToolUse.filter((e) => e.marker === 'someone-else')
     const ours = preToolUse.filter((e) => e.marker === 'dashi-channel-hook')
     expect(others.length).toBe(1)
-    expect(ours.length).toBe(1)
+    expect(ours.length).toBe(0) // narrow set: no PreToolUse feeder
     expect(others[0]!.hooks?.[0]?.command).toBe('echo unrelated')
+    // Our feeder still lands on the narrow events (e.g. Stop).
+    const stop = parsed.hooks?.Stop ?? []
+    expect(stop.some((e) => e.marker === 'dashi-channel-hook')).toBe(true)
   })
 })
 
@@ -255,14 +270,15 @@ describe('applyPatch (pure)', () => {
       webhookUrl: 'http://x',
       helperPath: '/new/plugin/scripts/post-hook.ts',
     }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
-    for (const ev of ['PreToolUse', 'Stop']) {
-      const arr = out.hooks[ev] ?? []
-      expect(arr.length).toBe(1)
-      expect(arr[0]!.marker).toBe('dashi-channel-hook')
-      expect(arr[0]!.hooks?.[0]?.command).toContain('/new/plugin/scripts/post-hook.ts')
-      // Old legacy command must be gone.
-      expect(arr.find((e) => e.hooks?.[0]?.command === legacyCmd)).toBeUndefined()
-    }
+    // Stop is a feeder event: the legacy entry is replaced by our marked one.
+    const stop = out.hooks.Stop ?? []
+    expect(stop.length).toBe(1)
+    expect(stop[0]!.marker).toBe('dashi-channel-hook')
+    expect(stop[0]!.hooks?.[0]?.command).toContain('/new/plugin/scripts/post-hook.ts')
+    expect(stop.find((e) => e.hooks?.[0]?.command === legacyCmd)).toBeUndefined()
+    // PreToolUse is NOT a feeder event: the legacy entry is stripped and, with
+    // no gate, nothing replaces it — the key is dropped entirely.
+    expect(out.hooks.PreToolUse).toBeUndefined()
   })
 
   test('replaces previous dashi-channel-hook entry rather than appending', () => {
@@ -298,15 +314,16 @@ describe('applyPatch (pure)', () => {
       permissionGateHelperPath: '/p/scripts/permission-gate-hook.ts',
     }) as GateHooks
     const pre = out.hooks.PreToolUse ?? []
-    // Gate entry is first, notification mirror second.
+    // Gate entry is first (and, in the narrow set, the ONLY PreToolUse entry —
+    // the notification feeder no longer lands here).
     expect(pre[0]!.marker).toBe('dashi-permission-gate-hook')
     expect(pre[0]!.hooks?.[0]?.command).toContain('permission-gate-hook.ts')
     // Hands the bare origin (no /hooks/agent path) to the gate hook.
     expect(pre[0]!.hooks?.[0]?.command).toContain("TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8093'")
     expect(pre[0]!.hooks?.[0]?.command).not.toContain('/hooks/agent')
-    expect(pre.some((e) => e.marker === 'dashi-channel-hook')).toBe(true)
+    expect(pre.some((e) => e.marker === 'dashi-channel-hook')).toBe(false)
     // No gate entry leaks onto other events.
-    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop']) {
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'SessionEnd', 'Stop']) {
       expect((out.hooks[ev] ?? []).some((e) => e.marker === 'dashi-permission-gate-hook')).toBe(false)
     }
   })
@@ -391,6 +408,37 @@ describe('applyPatch (pure) — channel reminder', () => {
     expect((out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
   })
 
+  test('bakes the resolved state root into the reminder command (fix-loop #5)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093/hooks/agent',
+      helperPath: '/p/scripts/post-hook.ts',
+      reminderHelperPath: '/p/scripts/channel-reminder.ts',
+      reminderStateDir: '/home/u/.claude/channels/dashi-telegram-canary',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    const cmd = reminder!.hooks?.[0]?.command ?? ''
+    // Inline env assignment survives env -i multichat spawns and default
+    // installs where TELEGRAM_STATE_DIR is never exported.
+    expect(cmd).toContain("TELEGRAM_STATE_DIR='/home/u/.claude/channels/dashi-telegram-canary'")
+    // CHAT_ID stays first; the command still points at the helper.
+    expect(cmd.indexOf('CHAT_ID=')).toBeLessThan(cmd.indexOf('TELEGRAM_STATE_DIR='))
+    expect(cmd).toContain('channel-reminder.ts')
+  })
+
+  test('absent reminderStateDir → command has no TELEGRAM_STATE_DIR (back-compat)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://x',
+      helperPath: '/p/post-hook.ts',
+      reminderHelperPath: '/p/channel-reminder.ts',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    expect(reminder!.hooks?.[0]?.command).not.toContain('TELEGRAM_STATE_DIR=')
+  })
+
   test('re-run replaces the reminder entry rather than duplicating', () => {
     const opts = {
       settingsPath: '/tmp/x', chatId: '1', webhookUrl: 'http://x',
@@ -400,5 +448,79 @@ describe('applyPatch (pure) — channel reminder', () => {
     s = applyPatch(s, opts)
     const ups = (s as { hooks: Record<string, Array<{ marker?: string }>> }).hooks.UserPromptSubmit ?? []
     expect(ups.filter((e) => e.marker === 'dashi-channel-reminder-hook').length).toBe(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 SHOULD — wide-feeder narrowing detection
+// ─────────────────────────────────────────────────────────────────────
+
+describe('hasWideDashiFeeder', () => {
+  test('detects an old wide install: dashi feeder on PreToolUse', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PreToolUse: [
+            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'bun post-hook.ts' }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+  })
+
+  test('detects an unscoped PostToolUse feeder (marked or legacy markerless)', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'x' }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            // legacy markerless entry pointing at our helper, no matcher
+            { hooks: [{ type: 'command', command: "bun '/some/where/post-hook.ts'" }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+  })
+
+  test('a NARROW install (scoped PostToolUse, no PreToolUse feeder) is not flagged', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            {
+              marker: 'dashi-channel-hook',
+              matcher: 'TaskCreate|TaskUpdate|TodoWrite',
+              hooks: [{ type: 'command', command: 'x' }],
+            },
+          ],
+          PreToolUse: [
+            // the permission gate is NOT a feeder
+            { marker: 'dashi-permission-gate-hook', matcher: '.*', hooks: [{ type: 'command', command: 'gate' }] },
+          ],
+        },
+      }),
+    ).toBe(false)
+  })
+
+  test('unrelated third-party hooks are not flagged', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PreToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: 'some-other-tool' }] }],
+        },
+      }),
+    ).toBe(false)
   })
 })

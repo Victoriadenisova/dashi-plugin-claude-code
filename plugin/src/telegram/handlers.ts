@@ -18,6 +18,13 @@ import type { Context } from 'grammy'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
 import type { AppConfig, StatePaths } from '../config.js'
+import {
+  resolveContextWindowOverride,
+  resolveContextWindowTokens,
+  resolveGuestModeAllowedUserIds,
+  resolveGuestModeEnabled,
+} from '../config.js'
+import type { GuestQueryRegistry } from './guest-queries.js'
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import type { StatusManager } from '../status/status-manager.js'
@@ -33,12 +40,24 @@ import {
   type TelegramReplyMessage,
 } from '../prompt/build.js'
 import {
-  downloadPhotoToInbox,
-  maybeTranscribeVoice,
   renderMediaDescriptor,
   type BotApiForDownload,
   type MediaDescriptor,
 } from './media.js'
+import {
+  buildAnimationDescriptor,
+  buildAudioDescriptor,
+  buildDocumentDescriptor,
+  buildOwnMediaDescriptors,
+  buildPhotoDescriptor,
+  buildReplyMediaDescriptors,
+  buildStickerDescriptor,
+  buildVideoDescriptor,
+  buildVideoNoteDescriptor,
+  buildVoiceDescriptor,
+  type PhotoDownloadDeps,
+  type VoiceTranscribeDeps,
+} from './media-descriptors.js'
 import {
   executeOobResult,
   handleOobCommand,
@@ -148,8 +167,22 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // Context HUD / status pin (2026-07-04): bump() re-anchors the pinned
+  // status card at the bottom of the chat on every inbound owner message —
+  // sequenced BEFORE tmuxMirror.bump so the card lands ABOVE the mirror.
+  // Optional so older tests compile; the HUD gates on owner internally.
+  contextHud?: { bump(chatId: string): Promise<void> }
   // /keys target — resolved tmux pane of the agent session (server.ts wiring).
   tmuxKeys?: { target: TmuxKeysTarget }
+  // Session facts (transcript_path + model) learned from Claude hook events,
+  // surfaced by /status (context usage). Structural getter so handlers stay
+  // decoupled from the concrete SessionInfoStore. Optional — absent in legacy
+  // wiring / tests, in which case /status shows «контекст: —».
+  sessionInfo?: { get(chatId?: string): { transcriptPath?: string; model?: string } }
+  // The model id the hosting Claude Code process was launched with (readLaunchModelId,
+  // resolved once at boot). Carries the `[1m]` window marker that the transcript's
+  // model id drops, so /status can resolve a 1M window exactly like the pinned HUD.
+  launchModel?: string | undefined
   // Multichat router. When present together with `policy`, all gated
   // inbound traffic is dispatched to the per-chat tmux session via
   // `router.dispatch(InboundMessage)` instead of the legacy
@@ -168,6 +201,12 @@ export interface HandlerDeps {
   // wiring / tests that predate TASK-2), the consumption is skipped
   // and inbound text flows through the existing paths unchanged.
   askUserQuestionUi?: AskUserQuestionUi
+  // Guest Mode (2026-07-04): registry of pending one-shot guest queries.
+  // handleGuestMessage registers allowlisted queries here; the `reply`
+  // tool claims them when answering via answerGuestQuery. Optional so
+  // pre-guest tests compile — when absent, guest updates are dropped
+  // with a wiring warning.
+  guestQueries?: GuestQueryRegistry
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -191,6 +230,14 @@ function adaptReply(
   }
   if (reply.text !== undefined) out.text = reply.text
   if (reply.caption !== undefined) out.caption = reply.caption
+  // Reply-target media — METADATA ONLY. The reply author is NOT the
+  // allowlisted caller, so we never download a reply photo nor transcribe a
+  // reply voice; we only surface file_id + <media> descriptors so the agent
+  // can decide whether to fetch via download_attachment. This one fix point
+  // covers every reply path (DM, router, guest, album — all funnel through
+  // adaptReply → buildReplyContext).
+  const replyMedia = buildReplyMediaDescriptors(reply).map(renderMediaDescriptor)
+  if (replyMedia.length > 0) out.media = replyMedia
   return out
 }
 
@@ -285,16 +332,39 @@ function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
 // Bug #3 (TASK-4): use `isSideEffectAllowed` so a non-addressed group
 // message never re-anchors the mirror.
 function maybeBumpMirror(ctx: Context, deps: HandlerDeps): void {
-  if (!deps.tmuxMirror?.bump) return
+  const hasMirror = deps.tmuxMirror?.bump !== undefined
+  const hasHud = deps.contextHud !== undefined
+  if (!hasMirror && !hasHud) return
   if (!isSideEffectAllowed(ctx, deps.config, deps.policy)) return
   const chatNum = ctx.chat?.id
   if (chatNum === undefined) return
-  void deps.tmuxMirror.bump().catch((err) => {
-    deps.log.warn('tmux mirror bump error (ignored)', {
-      chat_id: String(chatNum),
-      error: err instanceof Error ? err.message : String(err),
-    })
-  })
+  const chatId = String(chatNum)
+  // Sequence matters (status-pin wave, 2026-07-04): the pinned status card
+  // re-anchors FIRST, the tmux mirror second, so the chat bottom always reads
+  // «status card above, mirror below». Each leg is best-effort — a HUD
+  // failure must never rob the mirror of its bump, and vice versa.
+  void (async () => {
+    if (hasHud) {
+      try {
+        await deps.contextHud!.bump(chatId)
+      } catch (err) {
+        deps.log.warn('context hud bump error (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    if (hasMirror) {
+      try {
+        await deps.tmuxMirror!.bump!()
+      } catch (err) {
+        deps.log.warn('tmux mirror bump error (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+  })()
 }
 
 // FIX-D M1 (2026-05-27): chat-type detection from a stringified Telegram
@@ -570,6 +640,138 @@ async function gateAndNotify(
     // does that on every handler throw). We never want infinite redelivery
     // for a notify-transport failure — the channel may be torn down.
     throw new Error('channel notify failed — message dead-lettered')
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Guest Mode (Bot API 10.0, 2026-07-04) — handle a one-shot guest
+// @-mention from a chat the bot is NOT a member of.
+//
+// Deliberately does NOT reuse gateAndNotify: the gate there reasons
+// about chats the bot belongs to (DM allowlist / multichat policy),
+// while a guest message arrives from an arbitrary foreign chat. The
+// only authentication primitive that makes sense is the CALLER user id
+// — fail-closed against resolveGuestModeAllowedUserIds. Everything
+// about the drop path is silent (no reaction, no answerGuestQuery
+// spent) so strangers mentioning the bot learn nothing.
+//
+// No status bubble and no router dispatch: the bot cannot sendMessage
+// into the foreign chat (not a member), and guest interactions are
+// one-shot by contract — they always flow to the master session via
+// the MCP notify path with `guest_query_id` in meta. The reply tool
+// closes the loop through answerGuestQuery.
+// ─────────────────────────────────────────────────────────────────────
+
+export async function handleGuestMessage(ctx: Context, deps: HandlerDeps): Promise<void> {
+  if (!resolveGuestModeEnabled(deps.config)) return
+
+  const msg = ctx.update?.guest_message
+  if (!msg) return
+
+  // Caller identity: Bot API docs describe guest_bot_caller_user on the
+  // outbound SentGuestMessage; on the inbound update the mentioning user
+  // is `from`. We accept either (caller wins) and fail closed when both
+  // are absent.
+  const caller = msg.guest_bot_caller_user ?? msg.from
+  if (caller === undefined) {
+    deps.log.debug('guest_message dropped', { reason: 'missing_caller' })
+    return
+  }
+  const allowed = new Set(
+    resolveGuestModeAllowedUserIds(deps.config).map((n) => String(n)),
+  )
+  if (!allowed.has(String(caller.id))) {
+    deps.log.info('guest_message dropped', {
+      reason: 'caller_not_allowed',
+      caller_id: caller.id,
+      chat_id: msg.chat?.id,
+    })
+    return
+  }
+
+  const guestQueryId = msg.guest_query_id
+  if (guestQueryId === undefined || guestQueryId === '') {
+    deps.log.warn('guest_message without guest_query_id — dropped', {
+      chat_id: msg.chat?.id,
+    })
+    return
+  }
+
+  const text = (msg.text ?? msg.caption ?? '').trim()
+
+  // Registry must be wired before any eager media work — a misconfigured
+  // deployment drops here without wasting a download / transcription.
+  if (deps.guestQueries === undefined) {
+    deps.log.error('guest_message dropped — guest_mode.enabled but no GuestQueryRegistry wired', {
+      hint: 'server.ts must construct GuestQueryRegistry when guest_mode.enabled',
+    })
+    return
+  }
+
+  // The guest CALLER is allowlisted (gated above), so the guest's OWN media
+  // is handled exactly like a DM attachment: photo eager-downloaded to the
+  // inbox, voice transcribed, everything else surfaced as a descriptor. This
+  // is the SAME shared builder the DM per-kind handlers use. Computed BEFORE
+  // the drop gate so a media-only mention is never dropped for empty text.
+  const descriptors = await buildOwnMediaDescriptors(msg, {
+    photo: photoDownloadDeps(deps),
+    voice: voiceTranscribeDeps(deps),
+  })
+  const renderedMedia = descriptors.map(renderMediaDescriptor)
+
+  // Drop only when the mention carries NOTHING — no text/caption AND no
+  // media. A media-only @-mention (e.g. a photo with no caption) is a
+  // legitimate request and must survive (the pre-fix gate dropped it before
+  // media was ever looked at).
+  if (text === '' && renderedMedia.length === 0) {
+    deps.log.info('guest_message dropped', { reason: 'empty_text', chat_id: msg.chat?.id })
+    return
+  }
+
+  const chatIdStr = msg.chat?.id !== undefined ? String(msg.chat.id) : undefined
+  const admitted = deps.guestQueries.register({
+    guestQueryId,
+    callerUserId: String(caller.id),
+    ...(chatIdStr !== undefined ? { callerChatId: chatIdStr } : {}),
+    messageText: text,
+  })
+  if (!admitted) {
+    // Registry at cap with every entry inflight — pathological (needs 64
+    // concurrent unanswered claims). Dropping is safer than evicting an
+    // inflight entry and stranding its post-failure retry (dual review
+    // 2026-07-04, Codex #2).
+    deps.log.warn('guest_message dropped — registry at capacity, all entries inflight', {
+      caller_id: caller.id,
+      chat_id: chatIdStr,
+    })
+    return
+  }
+
+  const content = buildChannelContent({
+    text,
+    bot: deps.bot,
+    ...(renderedMedia.length > 0 ? { mediaDescriptors: renderedMedia } : {}),
+    ...(msg.reply_to_message ? { reply: adaptReply(msg.reply_to_message)! } : {}),
+  })
+
+  const meta: Record<string, string> = {
+    source: 'telegram',
+    guest: '1',
+    guest_query_id: guestQueryId,
+    user_id: String(caller.id),
+    ts: new Date().toISOString(),
+  }
+  if (chatIdStr !== undefined) meta.chat_id = chatIdStr
+  if (msg.message_id !== undefined) meta.message_id = String(msg.message_id)
+
+  deps.log.info('guest inbound delivered', {
+    caller_id: caller.id,
+    chat_id: chatIdStr,
+    pending: deps.guestQueries.pendingCount(),
+  })
+  const delivered = await sendChannelNotification(deps.server, { content, meta }, deps.log)
+  if (!delivered) {
+    throw new Error('channel notify failed — guest message dead-lettered')
   }
 }
 
@@ -1111,6 +1313,13 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
     const allowedChatSet = new Set(deps.config.allowed_chat_ids.map((v) => String(v)))
     const allowedChat = chatNum !== undefined && allowedChatSet.has(String(chatNum))
     if (chatType === 'private' && chatId && senderId && allowedSender && allowedChat) {
+      // Session facts for /status context usage: transcript_path + model
+      // learned from hook events (per chat when multichat). Snapshot at
+      // command time — /status is itself a snapshot.
+      const session = deps.sessionInfo?.get(chatId)
+      // Operator override resolved once — passed SEPARATELY so /status can
+      // resolve the window model-aware (transcript model → 1M) like the HUD.
+      const windowOverride = resolveContextWindowOverride(deps.config)
       const oobCtx: OobContext = {
         chatId,
         senderId,
@@ -1119,6 +1328,15 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
         log: deps.log,
         botId: deps.bot.id,
         stateDir: deps.statePaths.root,
+        contextWindowTokens: resolveContextWindowTokens(deps.config),
+        uptimeSeconds: process.uptime(),
+        ...(ctx.message?.message_id !== undefined ? { messageId: ctx.message.message_id } : {}),
+        ...(windowOverride !== undefined ? { contextWindowOverride: windowOverride } : {}),
+        ...(deps.launchModel !== undefined && deps.launchModel.length > 0
+          ? { launchModel: deps.launchModel }
+          : {}),
+        ...(session?.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
+        ...(session?.model ? { modelName: session.model } : {}),
         ...(deps.statusManager
           ? {
               statusManager: {
@@ -1149,6 +1367,28 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Eager media-descriptor deps, derived from HandlerDeps. The per-kind
+// handlers below are thin wrappers over the shared builders in
+// media-descriptors.ts — the builders are the single source of truth for
+// descriptor shape, reused by the guest path (own media) and the reply
+// path (metadata only).
+// ─────────────────────────────────────────────────────────────────────
+
+function photoDownloadDeps(deps: HandlerDeps): PhotoDownloadDeps {
+  return { botApi: deps.botApi, botToken: deps.botToken, inboxDir: deps.statePaths.inbox }
+}
+
+function voiceTranscribeDeps(deps: HandlerDeps): VoiceTranscribeDeps {
+  return {
+    config: deps.config,
+    env: deps.env,
+    downloadFile: (fileId: string) =>
+      deps.telegramApi.downloadFile(fileId, deps.statePaths.inbox),
+    log: deps.log,
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Photo — picks largest size, downloads to inbox after the gate allows.
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1157,31 +1397,8 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
   // «Тралл занят» too — otherwise a busy-session photo/voice silently waits.
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
-  const buildPhoto = async (): Promise<MediaDescriptor[]> => {
-    const sizes = ctx.message?.photo
-    if (!sizes || sizes.length === 0) return []
-    // Telegram photo array is sorted ascending by resolution — pick last.
-    const largest = sizes[sizes.length - 1]
-    if (!largest) return []
-
-    const localPath = await downloadPhotoToInbox(
-      deps.botApi,
-      deps.botToken,
-      largest.file_id,
-      deps.statePaths.inbox,
-    )
-
-    const md: MediaDescriptor = {
-      kind: 'photo',
-      fileId: largest.file_id,
-      ...(largest.file_unique_id !== undefined ? { uniqueId: largest.file_unique_id } : {}),
-      ...(localPath !== undefined ? { localPath } : {}),
-      ...(largest.width !== undefined ? { width: largest.width } : {}),
-      ...(largest.height !== undefined ? { height: largest.height } : {}),
-      ...(largest.file_size !== undefined ? { size: largest.file_size } : {}),
-    }
-    return [md]
-  }
+  const buildPhoto = (): Promise<MediaDescriptor[]> =>
+    buildPhotoDescriptor(ctx.message?.photo, photoDownloadDeps(deps))
   if (await tryRouteToAlbumBuffer(ctx, deps, buildPhoto, 'photo')) return
   await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildPhoto, 'photo')
 }
@@ -1194,18 +1411,8 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
 export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Promise<void> {
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
-  const buildDoc = async (): Promise<MediaDescriptor[]> => {
-    const doc = ctx.message?.document
-    if (!doc) return []
-    const md: MediaDescriptor = {
-      kind: 'document',
-      fileId: doc.file_id,
-      ...(doc.file_name !== undefined ? { name: doc.file_name } : {}),
-      ...(doc.mime_type !== undefined ? { mime: doc.mime_type } : {}),
-      ...(doc.file_size !== undefined ? { size: doc.file_size } : {}),
-    }
-    return [md]
-  }
+  const buildDoc = async (): Promise<MediaDescriptor[]> =>
+    buildDocumentDescriptor(ctx.message?.document)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildDoc, 'document')) return
   await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildDoc, 'document')
 }
@@ -1222,43 +1429,7 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
     ctx,
     deps,
     () => ctx.message?.caption ?? '',
-    async () => {
-      const voice = ctx.message?.voice
-      if (!voice) return []
-
-      const transcription = await maybeTranscribeVoice(
-        {
-          fileId: voice.file_id,
-          ...(voice.duration !== undefined ? { durationSec: voice.duration } : {}),
-          ...(voice.file_size !== undefined ? { size: voice.file_size } : {}),
-          ...(voice.mime_type !== undefined ? { mime: voice.mime_type } : {}),
-          downloadFile: (fileId: string) =>
-            deps.telegramApi.downloadFile(fileId, deps.statePaths.inbox),
-        },
-        deps.config,
-        deps.env,
-      )
-
-      if (transcription.status === 'failed' || transcription.status === 'skipped') {
-        deps.log.warn('voice transcription failed', {
-          status: transcription.status,
-          error: transcription.errorMessage,
-        })
-      }
-
-      const md: MediaDescriptor = {
-        kind: 'voice',
-        fileId: voice.file_id,
-        ...(voice.mime_type !== undefined ? { mime: voice.mime_type } : {}),
-        ...(voice.file_size !== undefined ? { size: voice.file_size } : {}),
-        ...(voice.duration !== undefined ? { durationSec: voice.duration } : {}),
-        ...(transcription.transcript !== undefined
-          ? { transcript: transcription.transcript }
-          : {}),
-        transcriptionStatus: transcription.status,
-      }
-      return [md]
-    },
+    () => buildVoiceDescriptor(ctx.message?.voice, voiceTranscribeDeps(deps)),
     'voice',
   )
 }
@@ -1270,21 +1441,8 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
 export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promise<void> {
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
-  const buildAudio = async (): Promise<MediaDescriptor[]> => {
-    const audio = ctx.message?.audio
-    if (!audio) return []
-    const md: MediaDescriptor = {
-      kind: 'audio',
-      fileId: audio.file_id,
-      ...(audio.file_name !== undefined ? { name: audio.file_name } : {}),
-      ...(audio.title !== undefined ? { title: audio.title } : {}),
-      ...(audio.performer !== undefined ? { performer: audio.performer } : {}),
-      ...(audio.mime_type !== undefined ? { mime: audio.mime_type } : {}),
-      ...(audio.file_size !== undefined ? { size: audio.file_size } : {}),
-      ...(audio.duration !== undefined ? { durationSec: audio.duration } : {}),
-    }
-    return [md]
-  }
+  const buildAudio = async (): Promise<MediaDescriptor[]> =>
+    buildAudioDescriptor(ctx.message?.audio)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildAudio, 'audio')) return
   await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildAudio, 'audio')
 }
@@ -1296,23 +1454,28 @@ export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promi
 export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promise<void> {
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
-  const buildVideo = async (): Promise<MediaDescriptor[]> => {
-    const video = ctx.message?.video
-    if (!video) return []
-    const md: MediaDescriptor = {
-      kind: 'video',
-      fileId: video.file_id,
-      ...(video.file_name !== undefined ? { name: video.file_name } : {}),
-      ...(video.mime_type !== undefined ? { mime: video.mime_type } : {}),
-      ...(video.file_size !== undefined ? { size: video.file_size } : {}),
-      ...(video.duration !== undefined ? { durationSec: video.duration } : {}),
-      ...(video.width !== undefined ? { width: video.width } : {}),
-      ...(video.height !== undefined ? { height: video.height } : {}),
-    }
-    return [md]
-  }
+  const buildVideo = async (): Promise<MediaDescriptor[]> =>
+    buildVideoDescriptor(ctx.message?.video)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildVideo, 'video')) return
   await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildVideo, 'video')
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Animation (GIF / silent looping MP4) — metadata only. Telegram sets the
+// `document` field on the same message for backward compatibility, so the
+// server MUST register this handler BEFORE `message:document` (otherwise
+// the document handler swallows the GIF and it never gets an animation
+// descriptor). Mirrors handleInboundVideo — an animation is a soundless
+// short video from the API's point of view.
+// ─────────────────────────────────────────────────────────────────────
+
+export async function handleInboundAnimation(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
+  maybeBumpMirror(ctx, deps)
+  const buildAnimation = async (): Promise<MediaDescriptor[]> =>
+    buildAnimationDescriptor(ctx.message?.animation)
+  if (await tryRouteToAlbumBuffer(ctx, deps, buildAnimation, 'animation')) return
+  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildAnimation, 'animation')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1327,17 +1490,7 @@ export async function handleInboundVideoNote(ctx: Context, deps: HandlerDeps): P
     ctx,
     deps,
     () => '',
-    async () => {
-      const note = ctx.message?.video_note
-      if (!note) return []
-      const md: MediaDescriptor = {
-        kind: 'video_note',
-        fileId: note.file_id,
-        ...(note.file_size !== undefined ? { size: note.file_size } : {}),
-        ...(note.duration !== undefined ? { durationSec: note.duration } : {}),
-      }
-      return [md]
-    },
+    () => Promise.resolve(buildVideoNoteDescriptor(ctx.message?.video_note)),
     'video_note',
   )
 }
@@ -1353,18 +1506,7 @@ export async function handleInboundSticker(ctx: Context, deps: HandlerDeps): Pro
     ctx,
     deps,
     () => '',
-    async () => {
-      const sticker = ctx.message?.sticker
-      if (!sticker) return []
-      const md: MediaDescriptor = {
-        kind: 'sticker',
-        fileId: sticker.file_id,
-        ...(sticker.emoji !== undefined ? { emoji: sticker.emoji } : {}),
-        ...(sticker.set_name !== undefined ? { setName: sticker.set_name } : {}),
-        ...(sticker.file_size !== undefined ? { size: sticker.file_size } : {}),
-      }
-      return [md]
-    },
+    () => Promise.resolve(buildStickerDescriptor(ctx.message?.sticker)),
     'sticker',
   )
 }

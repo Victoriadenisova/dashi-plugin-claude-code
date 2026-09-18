@@ -44,7 +44,19 @@ export const AppConfigSchema = z.object({
   dm_only: z.boolean().default(true),
   allowed_user_ids: z.array(z.number().int().positive()).min(1).default([164795011]),
   allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([164795011]),
+  // Owner DM chat ids for OWNER-ONLY surfaces (the pinned context HUD + the
+  // owner command menu). Distinct from `allowed_chat_ids`, which in multichat
+  // ALSO lists group/supergroup ids — a HUD with destructive buttons or the
+  // command menu must NEVER be pinned in a public group (FIX-8). Optional: when
+  // omitted, `resolveOwnerChatIds` falls back to `allowed_user_ids` (in a DM the
+  // chat id equals the positive user id). Positive ids only.
+  owner_chat_ids: z.array(z.number().int().positive()).optional(),
   workspace_root: z.string().optional(),
+  // Model context-window size in tokens, used by /status (context usage) and
+  // the context HUD. Optional — resolved via `resolveContextWindowTokens`,
+  // which applies the 200k default so the field stays absent-friendly for the
+  // many test config literals that predate it.
+  context_window_tokens: z.number().int().positive().optional(),
   // 2026-06-09 duplicate-windows fix: StatusManager and ProgressReporter
   // both defaulted ON, so a fresh install with hooks registered rendered two
   // hook-driven «working/running» Telegram windows next to the tmux mirror.
@@ -295,6 +307,79 @@ export const AppConfigSchema = z.object({
     timeout_ms: z.number().int().positive().default(120_000),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).default({}),
+  // Guest Mode (Bot API 10.0, 2026-07-04) — @-mention the bot in ANY chat
+  // (including chats the bot is not a member of); Telegram delivers a
+  // one-shot `guest_message` update and the bot answers exactly once via
+  // answerGuestQuery. Requires the owner to flip the Guest Mode toggle in
+  // BotFather (getMe.supports_guest_queries turns true).
+  //
+  // Default OFF: the handler is only registered when enabled, so existing
+  // deployments see zero behaviour change until the operator opts in.
+  //
+  // `allowed_user_ids` omitted → inherit the top-level `allowed_user_ids`
+  // (the owner DM allowlist) via resolveGuestModeAllowedUserIds — same
+  // single-source-of-truth pattern as permission_relay inheritance. The
+  // gate is fail-closed on `guest_bot_caller_user.id`: mentions from
+  // anyone else are silently dropped (no answerGuestQuery spent).
+  //
+  // The whole block is OPTIONAL (no `.default({})`) — same trick as `hud`
+  // below — so the many pre-guest test config literals stay valid without
+  // adding the field. `resolveGuestModeEnabled` applies the off-by-default
+  // fallback in one place.
+  guest_mode: z.object({
+    enabled: z.boolean().default(false),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+  }).optional(),
+  // Ask-guard (autonomy M3, 2026-07-10) — the ENFORCEMENT of owner-granted
+  // autonomy mandates on the owner-egress reply path. When the agent holds an
+  // ACTIVE lease for a chat and still writes a «жду го / дай добро»-style
+  // self-gating permission-ask, the guard intercepts (see safety/ask-guard.ts).
+  //
+  //   `mode`:
+  //     'off'      — never engage (equivalent to the kill-switch);
+  //     'advisory' — the reply IS sent, plus an `ask_guard_hint` nudging the
+  //                  agent to act-with-veto (the calibration-week default);
+  //     'block'    — the reply is REFUSED (isError, not sent); the agent must
+  //                  act in-scope and report, or ask via the AskUserQuestion
+  //                  card (that path is never guarded).
+  //
+  // The block is OPTIONAL (no `.default({})`), like `hud`/`guest_mode` below,
+  // so the many pre-M3 test config literals stay valid without adding it.
+  // `resolveAskGuardMode` applies the 'advisory' default and the env overrides
+  // (`ASK_GUARD_MODE`, kill-switch `ASK_GUARD_ENABLED=0`) in one place.
+  ask_guard: z.object({
+    mode: z.enum(['off', 'advisory', 'block']).default('advisory'),
+  }).optional(),
+  // Context HUD (wave 3B) — a single pinned Telegram message in the owner's
+  // chat that shows context-window usage (bar + percentage) plus the «Сжать»
+  // action button, refreshed after each turn (SessionStart / Stop hooks).
+  // Default ON.
+  //
+  // The whole block is OPTIONAL (no `.default({})`) so `hud` reads as
+  // `hud?: { enabled: boolean }` on the inferred type — existing full-config
+  // test literals that predate this field stay valid without adding it.
+  // `resolveHudEnabled` applies the enabled-by-default fallback in one place.
+  hud: z.object({
+    enabled: z.boolean().default(true),
+  }).optional(),
+  // Rich Messages (M1, Bot API 10.1, 2026-06-14). When enabled, a DM reply
+  // whose body fits 32768 bytes ships as a single RAW-markdown rich message
+  // (Telegram renders tables/math/headings/task-lists/<details>/footnotes)
+  // with a TRANSPARENT fallback to the HTML path on any rejection. Default
+  // ON: the fallback makes it safe to enable everywhere — a build without the
+  // method latches off after one call and behaves exactly like before.
+  //
+  // `perChatOptOut` holds chat_ids (as strings, matching the inbound
+  // <channel chat_id="…">) that should NEVER receive rich messages — they
+  // always take the HTML path. Use it to pin a specific chat to the legacy
+  // rendering while the feature rolls out.
+  //
+  // Kill switch: set env TELEGRAM_RICH_MESSAGES to a falsy value (0/false/
+  // no/off) to force enabled=false fleet-wide without editing config.json.
+  richMessages: z.object({
+    enabled: z.boolean().default(true),
+    perChatOptOut: z.array(z.string()).default([]),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -366,6 +451,19 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: z.string().optional(), // CSV
   TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: z.coerce.number().int().positive().optional(),
+  // Rich Messages (M1, 2026-06-14). Kill switch: a falsy value
+  // (0/false/no/off, case-insensitive) forces richMessages.enabled=false;
+  // anything else (1/true/yes/on …) forces it true. Unset = config.json /
+  // schema default (true). Parsed to a boolean here; layered onto the
+  // richMessages block in loadConfig.
+  TELEGRAM_RICH_MESSAGES: z
+    .string()
+    .transform((v) => !/^(0|false|no|off)$/i.test(v.trim()))
+    .optional(),
+  // CSV of chat_ids that always take the HTML path (never rich). Mirrors the
+  // CSV chat-id parsing used for the allowlist; stored as strings to match
+  // the inbound <channel chat_id="…"> form the reply tool compares against.
+  TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT: z.string().optional(), // CSV
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
@@ -539,6 +637,22 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
   if (Object.keys(askUserQuestion).length > 0) merged.ask_user_question = askUserQuestion
 
+  // Rich Messages env overrides (M1, 2026-06-14). Same layering pattern: take
+  // the config.json sub-object if present, layer env on top, emit only when
+  // something is set so Zod applies schema defaults cleanly otherwise.
+  const richMessages = (merged.richMessages && typeof merged.richMessages === 'object'
+    ? merged.richMessages
+    : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_RICH_MESSAGES !== undefined) {
+    richMessages.enabled = parsedEnv.TELEGRAM_RICH_MESSAGES
+  }
+  if (parsedEnv.TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT !== undefined) {
+    // Chat ids stay as strings (matching the inbound <channel chat_id="…">).
+    // Reuse parseCsvChatIds for validation, then stringify each entry.
+    richMessages.perChatOptOut = parseCsvChatIds(parsedEnv.TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT).map(String)
+  }
+  if (Object.keys(richMessages).length > 0) merged.richMessages = richMessages
+
   try {
     return AppConfigSchema.parse(merged)
   } catch (err) {
@@ -564,6 +678,11 @@ export type StatePaths = {
   sessionIds: string
   deadLetterUpdates: string
   deadLetterWebhook: string
+  // M4 (2026-07-10): quarantine bucket for OUTBOUND Telegram sends that failed
+  // after the bounded retry policy exhausted (network / 5xx / 429). Distinct
+  // from the inbound `updates`/`webhook` buckets so operators can triage
+  // delivery failures separately.
+  deadLetterOutbound: string
   logs: {
     server: string
     telegram: string
@@ -602,6 +721,7 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
@@ -678,4 +798,335 @@ export function resolvePermissionGateAllowedUserIds(
   const inherited = config.permission_relay.allowed_user_ids
   if (log) log.info('permission_gate: allowed_user_ids unset, inheriting from permission_relay', { count: inherited.length, fallback: true })
   return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveGuestModeAllowedUserIds — single source of truth for who may
+// summon the bot via a guest @-mention. Explicit `guest_mode
+// .allowed_user_ids` wins; otherwise inherit the top-level
+// `allowed_user_ids` (the owner DM allowlist). Callers MUST go through
+// this helper so the fallback lives in exactly one place.
+// ─────────────────────────────────────────────────────────────────────
+
+// resolveGuestModeEnabled — whether Guest Mode handling is active. The
+// `guest_mode` block is optional; a missing block means OFF (unlike `hud`,
+// which defaults ON — guest handling must be a deliberate opt-in).
+export function resolveGuestModeEnabled(config: AppConfig): boolean {
+  return config.guest_mode?.enabled ?? false
+}
+
+export function resolveGuestModeAllowedUserIds(
+  config: AppConfig,
+  log?: AllowedUserIdsLogger,
+): readonly number[] {
+  const explicit = config.guest_mode?.allowed_user_ids
+  if (explicit !== undefined) {
+    if (log) log.info('guest_mode: using explicit allowed_user_ids', { count: explicit.length, fallback: false })
+    return explicit
+  }
+  const inherited = config.allowed_user_ids
+  if (log) log.info('guest_mode: allowed_user_ids unset, inheriting from allowed_user_ids', { count: inherited.length, fallback: true })
+  return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveContextWindowTokens — the model context-window size used by
+// /status (context usage) and the context HUD. Callers MUST go through this
+// helper rather than reading the raw field so the 200k default is applied in
+// exactly one place. Default matches the Claude 200k-token window.
+// ─────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+
+// ─────────────────────────────────────────────────────────────────────
+// Model → context-window table. Matched by case-insensitive SUBSTRING on the
+// session model id (the id the SessionStart/Stop hook reports, e.g.
+// `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-5`). First match wins,
+// so order from most-specific/largest to least. A wrong guess here is never
+// fatal — it is correctable at runtime via the `context_window_tokens` config
+// key or the `JARVIS_CONTEXT_WINDOW` env var (resolveContextWindowOverride),
+// which ALWAYS win over this table.
+//
+// Sonnet-5 is kept at 200k: the repo carries no evidence of a 1M Sonnet-5
+// window at time of writing. If that changes, either add a rule or set the
+// override — no other code touch needed.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface ModelContextWindowRule {
+  // Lowercased substring matched against the (lowercased) model id.
+  match: string
+  // Context-window size in tokens for a model whose id contains `match`.
+  windowTokens: number
+}
+
+export const MODEL_CONTEXT_WINDOWS: ReadonlyArray<ModelContextWindowRule> = [
+  // Fable 5 ships a 1M-token context window.
+  { match: 'fable', windowTokens: 1_000_000 },
+  // Opus 5 — base window 200k; the 1M variant is requested via the [1m]
+  // marker (checked BEFORE this table), exactly like Opus 4.8.
+  { match: 'claude-opus-5', windowTokens: 200_000 },
+  // Opus 4.x (any minor) — 200k.
+  { match: 'claude-opus-4', windowTokens: 200_000 },
+  // Sonnet 5 / Sonnet 4 — 200k (see note above re: Sonnet-5).
+  { match: 'claude-sonnet-5', windowTokens: 200_000 },
+  { match: 'sonnet-4', windowTokens: 200_000 },
+  // Haiku — 200k.
+  { match: 'haiku', windowTokens: 200_000 },
+]
+
+// Explicit «[1m]» / «1m» context-window marker. Claude Code annotates a
+// 1M-window model variant this way (e.g. `claude-opus-4-8[1m]`), so the marker
+// is authoritative and beats the family table — an Opus-1M session must not be
+// under-reported as 200k. Matches the bracketed form and a standalone `1m`
+// token (word-boundaried so it never trips on unrelated ids).
+const ONE_MILLION_MARKER = /\[1m\]|(?:^|[^a-z0-9])1m(?:[^a-z0-9]|$)/i
+
+// The 1M marker is NOT always echoed back by the API. Claude Code launched as
+// `claude --model claude-opus-5[1m]` serves turns whose transcript `model` is
+// the BARE id `claude-opus-5` — the marker survives only in the CLI argv. So a
+// transcript id alone cannot tell a 200k Opus-5 session from a 1M one, and the
+// family table (honest 200k default) under-reports the window by 5x. The launch
+// flag is the missing fact: when it carries the marker AND names the same model
+// the transcript reports, the session IS the 1M variant.
+//
+// Parse the model id out of a Claude Code argv array (`--model <id>` or
+// `--model=<id>`). PURE. Returns undefined when the flag is absent or has no
+// value. The LAST occurrence wins, matching CLI flag semantics.
+export function parseLaunchModelFlag(argv: readonly string[]): string | undefined {
+  let found: string | undefined
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]
+    if (arg === undefined) continue
+    // `--` ends option parsing; everything after it is positional (codex LOW).
+    if (arg === '--') break
+    if (arg === '--model') {
+      // Reset FIRST: a later malformed `--model` overrides an earlier good one,
+      // matching real CLI semantics — the flag was re-specified (codex LOW).
+      found = undefined
+      const next = argv[i + 1]
+      // A bare trailing `--model`, or one followed by another flag, has no value.
+      if (next !== undefined && next.length > 0 && !next.startsWith('-')) found = next
+      continue
+    }
+    if (arg.startsWith('--model=')) {
+      const value = arg.slice('--model='.length)
+      found = value.length > 0 ? value : undefined
+    }
+  }
+  return found
+}
+
+// Strip an explicit window marker from a model id, leaving the bare id used to
+// compare a launch flag against a transcript-reported model.
+function stripWindowMarker(id: string): string {
+  return id.replace(/\[1m\]/gi, '').trim()
+}
+
+// Does `launchModel` prove that `id` (a transcript model id, lowercased, with no
+// marker of its own) is running the 1M variant? Only when the launch flag both
+// carries the marker AND names EXACTLY the model the transcript reports.
+//
+// Exact equality, not a family match: a family match in either direction lets a
+// short alias (`--model opus[1m]`) claim a 1M window for every Opus id the
+// session might later serve, which is not proof of anything (codex HIGH,
+// 2026-08-18).
+//
+// KNOWN LIMIT: a mid-session `/model` switch BETWEEN the 1M and 200k variants of
+// the SAME model is invisible here — both serve the identical bare transcript id
+// (`claude-opus-5`), so the launch flag stays the only evidence and the HUD keeps
+// reporting 1M until restart. Switching to any OTHER model is handled correctly
+// (different id → no match). The operator override remains the escape hatch.
+function launchProvesOneMillion(id: string, launchModel: string | undefined): boolean {
+  if (launchModel === undefined || launchModel.length === 0) return false
+  const launch = launchModel.toLowerCase()
+  if (!ONE_MILLION_MARKER.test(launch)) return false
+  return stripWindowMarker(launch) === id
+}
+
+// Normalize an operator-supplied window value to a usable token count, or
+// undefined when it is unusable. Floor FIRST, then accept only >= 1 — the
+// other order lets a fractional 0.5 pass the `> 0` check and floor to 0,
+// producing a zero denominator (codex review MED, 2026-07-10).
+function normalizeWindowValue(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const floored = Math.floor(value)
+  return floored >= 1 ? floored : undefined
+}
+
+// Token-boundary match of a family id against a model id (both lowercased).
+// A raw substring check made 'claude-unfabled-5' match 'fable' → 1M (codex
+// review LOW, 2026-07-10). The family must be delimited by a separator
+// (- / : _ .) or the start/end of the string on BOTH sides; separators INSIDE
+// the family id (e.g. 'claude-opus-4') still match normally.
+const FAMILY_SEPARATORS = new Set(['-', '/', ':', '_', '.'])
+
+function matchesModelFamily(id: string, family: string): boolean {
+  let from = 0
+  while (from <= id.length - family.length) {
+    const idx = id.indexOf(family, from)
+    if (idx === -1) return false
+    const before = idx === 0 ? undefined : id[idx - 1]
+    const afterChar = id[idx + family.length]
+    const boundary = (c: string | undefined): boolean =>
+      c === undefined || FAMILY_SEPARATORS.has(c)
+    if (boundary(before) && boundary(afterChar)) return true
+    from = idx + 1
+  }
+  return false
+}
+
+/**
+ * Resolve the context-window size (tokens) for a session model id.
+ *
+ * Priority (first hit wins):
+ *  1. `opts.override` — an explicit operator value (config `context_window_tokens`
+ *     / `JARVIS_CONTEXT_WINDOW`). ALWAYS wins so a wrong table guess is fixable
+ *     without a code change.
+ *  2. An explicit `[1m]` / `1m` window marker on the model id → 1M.
+ *  3. `opts.launchModel` — the CLI `--model` flag — when it carries the marker
+ *     and names the SAME model the transcript reports → 1M. Covers the ids the
+ *     API returns bare (e.g. `claude-opus-5` served by `--model
+ *     claude-opus-5[1m]`), where the marker exists only in the launch argv.
+ *  4. The MODEL_CONTEXT_WINDOWS family table (first token-boundary match).
+ *  5. `opts.fallback` (defaults to DEFAULT_CONTEXT_WINDOW_TOKENS = 200k) —
+ *     unknown or absent model.
+ *
+ * PURE. Never throws, never returns 0 / negative — an honest 200k fallback is
+ * always safer than a broken denominator.
+ */
+export function resolveContextWindowForModel(
+  model: string | undefined,
+  opts?: {
+    override?: number | undefined
+    fallback?: number | undefined
+    launchModel?: string | undefined
+  },
+): number {
+  const fallback = normalizeWindowValue(opts?.fallback) ?? DEFAULT_CONTEXT_WINDOW_TOKENS
+  const override = normalizeWindowValue(opts?.override)
+  if (override !== undefined) return override
+  if (model === undefined || model.length === 0) return fallback
+  const id = model.toLowerCase()
+  if (ONE_MILLION_MARKER.test(id)) return 1_000_000
+  if (launchProvesOneMillion(id, opts?.launchModel)) return 1_000_000
+  for (const rule of MODEL_CONTEXT_WINDOWS) {
+    if (matchesModelFamily(id, rule.match)) return rule.windowTokens
+  }
+  return fallback
+}
+
+/**
+ * The EXPLICIT operator override for the context window, or `undefined` when
+ * none is set. Precedence: config `context_window_tokens` > `JARVIS_CONTEXT_WINDOW`
+ * env var. Returned separately from the default so callers with a session model
+ * (the context HUD) can let the override win over model auto-detection while an
+ * unset value falls through to the model table.
+ */
+export function resolveContextWindowOverride(config: AppConfig): number | undefined {
+  // Normalize the config value like every other operator input. An UNUSABLE
+  // config value (0, negative, NaN — possible when the config object bypassed
+  // schema validation, e.g. test literals) must FALL THROUGH to the env check,
+  // not suppress a valid JARVIS_CONTEXT_WINDOW (codex review MED, 2026-07-10).
+  const fromConfig = normalizeWindowValue(config.context_window_tokens)
+  if (fromConfig !== undefined) return fromConfig
+  const env = process.env.JARVIS_CONTEXT_WINDOW
+  if (env !== undefined && env.trim().length > 0) {
+    return normalizeWindowValue(Number(env.trim()))
+  }
+  return undefined
+}
+
+/**
+ * The configured context window with the 200k default applied. Legacy,
+ * model-unaware callers (/status, oob) use this. Honors the same override
+ * chain as resolveContextWindowOverride, then falls back to the 200k default.
+ */
+export function resolveContextWindowTokens(config: AppConfig): number {
+  return resolveContextWindowOverride(config) ?? DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveHudEnabled — whether the pinned context HUD (wave 3B) is active.
+// The `hud` config block is optional, so callers MUST go through this
+// helper rather than reading `config.hud?.enabled` directly: the
+// enabled-by-default fallback lives in exactly one place. A missing block
+// (older config.json / test literal) and an explicit `{ enabled: true }`
+// both resolve to true; only an explicit `{ enabled: false }` disables it.
+// ─────────────────────────────────────────────────────────────────────
+
+export function resolveHudEnabled(config: AppConfig): boolean {
+  return config.hud?.enabled ?? true
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveAskGuardMode — the effective ask-guard mode (autonomy M3). The
+// `ask_guard` config block is optional, so callers MUST go through this
+// helper rather than reading `config.ask_guard?.mode` directly: the
+// 'advisory' default AND the direct-env overrides live in exactly one place.
+//
+// Precedence (first decisive wins):
+//   1. kill-switch `ASK_GUARD_ENABLED` set to a falsy value (0/false/no/off)
+//      → 'off' (a hard OFF that beats any configured mode);
+//   2. `ASK_GUARD_MODE` env (off|advisory|block, case-insensitive);
+//   3. `config.ask_guard.mode`;
+//   4. 'advisory' (the calibration-week default).
+//
+// These two env vars are read from process.env directly (NOT via the
+// TELEGRAM_-prefixed RuntimeEnvSchema) — the same pattern as
+// resolveContextWindowOverride reading JARVIS_CONTEXT_WINDOW.
+// ─────────────────────────────────────────────────────────────────────
+
+export type AskGuardMode = 'off' | 'advisory' | 'block'
+
+// Minimal structural logger (avoids importing the full Logger type here and a
+// config.ts ↔ log.ts cycle). Matches Logger.warn's shape.
+export interface AskGuardModeLogger {
+  warn: (msg: string, ctx?: Record<string, unknown>) => void
+}
+
+export function resolveAskGuardMode(
+  config: AppConfig,
+  log?: AskGuardModeLogger,
+): AskGuardMode {
+  const enabled = process.env.ASK_GUARD_ENABLED
+  if (enabled !== undefined && /^(0|false|no|off)$/i.test(enabled.trim())) {
+    return 'off'
+  }
+  const envMode = process.env.ASK_GUARD_MODE
+  if (envMode !== undefined && envMode.trim() !== '') {
+    const m = envMode.trim().toLowerCase()
+    if (m === 'off' || m === 'advisory' || m === 'block') return m
+    // fix-loop #6 (Codex LOW-6): a SET-but-INVALID env value (e.g. «of», a typo
+    // of «off») must NOT silently fall through to a configured `block` — that
+    // would surprise-enable enforcement from a typo. Fail to the calibration
+    // default (advisory) and warn, so the misconfiguration is visible.
+    if (log) {
+      log.warn('ASK_GUARD_MODE set to an invalid value — defaulting to advisory', {
+        code: 'ask_guard_mode_invalid',
+        value: envMode.trim().slice(0, 32),
+      })
+    }
+    return 'advisory'
+  }
+  return config.ask_guard?.mode ?? 'advisory'
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveOwnerChatIds — the OWNER DM chat ids for owner-only surfaces (the
+// pinned context HUD + the owner command menu). FIX-8 (both reviews): these
+// MUST come from the owner's DM ids, NEVER from `allowed_chat_ids` (which in
+// multichat also lists group ids — a HUD with destructive buttons or the
+// command menu pinned in a public group is a serious leak). Explicit
+// `owner_chat_ids` wins; otherwise we fall back to `allowed_user_ids` (in a DM
+// the chat id equals the positive user id). Positive ids only — a group id can
+// never be an owner DM.
+// ─────────────────────────────────────────────────────────────────────
+
+export function resolveOwnerChatIds(config: AppConfig): readonly number[] {
+  const explicit = config.owner_chat_ids
+  if (explicit !== undefined && explicit.length > 0) {
+    const positive = explicit.filter((n) => Number.isInteger(n) && n > 0)
+    if (positive.length > 0) return positive
+  }
+  return config.allowed_user_ids
 }

@@ -40,6 +40,7 @@ function mkStatePaths(): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
@@ -92,6 +93,7 @@ function mkConfig(allowedIds: number[] = [164795011]): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
   }
 }
 

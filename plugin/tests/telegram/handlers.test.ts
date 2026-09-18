@@ -15,6 +15,7 @@ import type { Context } from 'grammy'
 
 import {
   handleInboundText,
+  handleInboundAnimation,
   handleInboundDocument,
   handleInboundSticker,
   handleInboundVideoNote,
@@ -25,6 +26,7 @@ import {
   type ProgressReporterForWatcher,
 } from '../../src/telegram/watcher.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
+import { activeLeases, loadAutonomyState } from '../../src/autonomy/store.js'
 import { createLogger } from '../../src/log.js'
 import type {
   PendingPermission,
@@ -79,6 +81,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
     ...overrides,
   }
 }
@@ -97,6 +100,7 @@ function makeStatePaths(): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
@@ -160,6 +164,8 @@ function makeTelegramApi(): {
   }
   const api: TelegramApi = {
     sendMessage: noop as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: async (chatId, messageId, emoji): Promise<void> => {
       reactions.push({ chatId, messageId, emoji })
@@ -171,6 +177,7 @@ function makeTelegramApi(): {
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
   }
   return { api, reactions }
 }
@@ -241,7 +248,7 @@ function makeCtx(opts: {
 // Minimal Context with a media payload — for media handler tests. Mirrors
 // makeCtx but attaches a typed media field instead of `text`.
 function makeMediaCtx(opts: {
-  kind: 'document' | 'sticker' | 'video_note'
+  kind: 'document' | 'sticker' | 'video_note' | 'animation'
   chatId: number
   chatType: 'private' | 'group' | 'supergroup'
   fromId: number
@@ -262,6 +269,14 @@ function makeMediaCtx(opts: {
       break
     case 'video_note':
       payload = { video_note: { file_id: 'vn-fid', duration: 5 } }
+      break
+    case 'animation':
+      // GIF: Telegram sets BOTH animation and document. We surface it via the
+      // animation descriptor (server registers animation before document).
+      payload = {
+        animation: { file_id: 'an-fid', file_name: 'g.mp4', mime_type: 'video/mp4', duration: 3 },
+        document: { file_id: 'an-doc-fid', file_name: 'g.mp4', mime_type: 'video/mp4' },
+      }
       break
   }
   return {
@@ -392,6 +407,50 @@ describe('handleInboundText — OOB allowed_chat_ids gate (Fix 6)', () => {
 
     // OOB handled inline — no channel notify for /help.
     expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  // Autonomy M2: /lease is one of only two authenticated lease-grant surfaces.
+  // The OOB gate is its authorization boundary — a non-allowed chat must mint
+  // NO lease, an allowed chat must.
+  test('/lease from a chat NOT in allowed_chat_ids: NO lease minted', async () => {
+    const config = makeConfig({ allowed_user_ids: [164795011], allowed_chat_ids: [164795011] })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({ config, server: serverSpy.server })
+    const ctx = makeCtx({ text: '/lease деплой', chatId: 99999, chatType: 'private', fromId: 164795011 })
+
+    await handleInboundText(ctx, deps)
+
+    // Gate rejected the OOB command → no grant happened for chat 99999.
+    expect(loadAutonomyState({ root: statePaths.root }, '99999').leases.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('/lease from the allowed owner chat mints a lease and replies', async () => {
+    const config = makeConfig()
+    const serverSpy = makeServerSpy()
+    const sends: string[] = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (_c, text) => {
+        sends.push(text)
+        return { message_id: 100 }
+      },
+    }
+    const { deps, statePaths } = makeDeps({ config, server: serverSpy.server, telegramApi: api })
+    const ctx = makeCtx({ text: '/lease деплой стейджинга; ttl=48h', chatId: 164795011, chatType: 'private', fromId: 164795011 })
+
+    await handleInboundText(ctx, deps)
+
+    const leases = activeLeases(loadAutonomyState({ root: statePaths.root }, '164795011'), Date.now())
+    expect(leases.length).toBe(1)
+    expect(leases[0]!.scope).toBe('деплой стейджинга')
+    expect(leases[0]!.source).toBe('owner_cmd')
+    // Control command is swallowed — no channel notification to the session.
+    expect(serverSpy.calls.length).toBe(0)
+    // The owner got a confirmation reply.
+    expect(sends.some((t) => t.includes('мандат выдан'))).toBe(true)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })
@@ -575,6 +634,7 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     ['document', handleInboundDocument],
     ['sticker', handleInboundSticker],
     ['video_note', handleInboundVideoNote],
+    ['animation', handleInboundAnimation],
   ] as const)(
     'media %s from allowed sender + busy session → watcher fires',
     async (kind, handler) => {
@@ -662,6 +722,28 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
       rmSync(statePaths.root, { recursive: true, force: true })
     },
   )
+
+  test('handleInboundAnimation delivers an animation descriptor (GIF support)', async () => {
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({ server: serverSpy.server })
+    const ctx = makeMediaCtx({
+      kind: 'animation',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundAnimation(ctx, deps)
+
+    expect(serverSpy.calls.length).toBe(1)
+    const content = JSON.stringify(serverSpy.calls[0]!.params)
+    expect(content).toContain('kind=\\"animation\\"')
+    expect(content).toContain('file_id=\\"an-fid\\"')
+    expect(content).toContain('mime=\\"video/mp4\\"')
+    // Surfaced as an animation, NOT the backward-compat document twin.
+    expect(content).not.toContain('an-doc-fid')
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
 
   test('plain text + NOT busy → watcher no-ops, channel notify still runs', async () => {
     const sendCalls: Array<{ chatId: string; text: string }> = []

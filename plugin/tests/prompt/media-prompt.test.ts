@@ -62,6 +62,7 @@ const voiceConfig: AppConfig = {
   multichat: { enabled: false },
   ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
   permission_gate: { enabled: false, timeout_ms: 120_000 },
+  richMessages: { enabled: false, perChatOptOut: [] },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -185,6 +186,27 @@ describe('renderMediaDescriptor', () => {
     expect(renderMediaDescriptor(md)).toBe(
       '<media kind="video_note" file_id="vnF" size="1024" duration_sec="12" />',
     )
+  })
+
+  test('builds animation tag (fields mirror video)', () => {
+    const md: MediaDescriptor = {
+      kind: 'animation',
+      fileId: 'anF',
+      name: 'giphy.mp4',
+      mime: 'video/mp4',
+      size: 2048,
+      durationSec: 3,
+      width: 320,
+      height: 240,
+    }
+    expect(renderMediaDescriptor(md)).toBe(
+      '<media kind="animation" file_id="anF" name="giphy.mp4" mime="video/mp4" size="2048" duration_sec="3" width="320" height="240" />',
+    )
+  })
+
+  test('animation omits undefined attributes', () => {
+    const md: MediaDescriptor = { kind: 'animation', fileId: 'anF2' }
+    expect(renderMediaDescriptor(md)).toBe('<media kind="animation" file_id="anF2" />')
   })
 
   test('omits undefined attributes', () => {

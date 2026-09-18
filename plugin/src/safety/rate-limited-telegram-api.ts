@@ -64,11 +64,14 @@ import {
 import { dirname } from 'path'
 import type { Logger } from '../log.js'
 import type {
+  AnswerGuestQueryOpts,
   ChatAction,
   DownloadResult,
   EditOpts,
   SendDocumentOpts,
   SendMessageOpts,
+  SendRichMessageOpts,
+  SendRichMessageResult,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -831,6 +834,35 @@ export function createRateLimitedTelegramApi(
       return enqueueSend(chatId, 'sendMessage', () => raw.sendMessage(chatId, text, sendOpts))
     },
 
+    // Rich messages consume the same per-chat send budget as a normal
+    // sendMessage (one outbound bubble), so they route through the identical
+    // FIFO + token-bucket + 429-retry path. Ordering with sibling sends to
+    // the same chat is preserved.
+    async editRichMessage(
+      chatId: string,
+      messageId: number,
+      rawMarkdown: string,
+    ) {
+      // Edits target a message already on screen — they do not create a new
+      // one, so they do not go through the per-chat send queue. Same path as
+      // editMessageText: send breaker + 429 retry, no bucket.
+      return withRetry(
+        'editMessageText',
+        () => raw.editRichMessage(chatId, messageId, rawMarkdown),
+        chatId,
+      )
+    },
+
+    async sendRichMessage(
+      chatId: string,
+      rawMarkdown: string,
+      richOpts: SendRichMessageOpts,
+    ): Promise<SendRichMessageResult> {
+      return enqueueSend(chatId, 'sendMessage', () =>
+        raw.sendRichMessage(chatId, rawMarkdown, richOpts),
+      )
+    },
+
     async editMessageText(
       chatId: string,
       messageId: number,
@@ -888,6 +920,20 @@ export function createRateLimitedTelegramApi(
 
     async withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T> {
       return withRetry(method, op, undefined, method === 'getFile' ? downloadBreaker : sendBreaker)
+    },
+
+    async answerGuestQuery(
+      guestQueryId: string,
+      text: string,
+      guestOpts: AnswerGuestQueryOpts,
+    ): Promise<void> {
+      // No per-chat FIFO: guest queries have no allowlisted chat id and are
+      // one-shot by contract — there is never a second send to order after.
+      // The 429-retry wrapper still applies (a retry of a FAILED call does
+      // not double-answer; Telegram only consumes the query on success).
+      return withRetry('answerGuestQuery', () =>
+        raw.answerGuestQuery(guestQueryId, text, guestOpts),
+      )
     },
   }
 }

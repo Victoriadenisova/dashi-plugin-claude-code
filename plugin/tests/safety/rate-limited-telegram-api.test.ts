@@ -41,6 +41,7 @@ interface SentCall {
     | 'sendPhoto'
     | 'deleteMessage'
     | 'downloadFile'
+    | 'answerGuestQuery'
   chatId?: string
   messageId?: number
   text?: string
@@ -124,6 +125,13 @@ function makeStubApi(clock: FakeClock): StubApi {
       calls.push({ method: 'sendMessage', chatId, text, opts, ts: clock.now() })
       return { message_id: calls.length }
     },
+    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+      // Pass-through stub; the rich path's own coverage lives in
+      // tests/safety/rich-path.test.ts. Routes through the same enqueue here.
+      maybeThrow('sendMessage')
+      return { message_id: calls.length + 1 }
+    },
+    async editRichMessage() { return { fallback: true } as const },
     async editMessageText(chatId, messageId, text, opts) {
       maybeThrow('editMessageText')
       calls.push({ method: 'editMessageText', chatId, messageId, text, opts, ts: clock.now() })
@@ -154,6 +162,10 @@ function makeStubApi(clock: FakeClock): StubApi {
     async deleteMessage(chatId, messageId) {
       maybeThrow('deleteMessage')
       calls.push({ method: 'deleteMessage', chatId, messageId, ts: clock.now() })
+    },
+    async answerGuestQuery(_guestQueryId, text, _opts) {
+      maybeThrow('answerGuestQuery')
+      calls.push({ method: 'answerGuestQuery', text, ts: clock.now() })
     },
   }
   return {
@@ -295,6 +307,22 @@ describe('createRateLimitedTelegramApi — global token bucket', () => {
     await clock.tick(1000)
     await p
     expect(stub.calls.length).toBe(3)
+  })
+
+  test('answerGuestQuery bypasses the send bucket but retries on 429', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const opts = defaultOpts(clock)
+    opts.perChatBurstCapacity = 1
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
+    // Exhaust the per-chat bucket — guest answers must not care (no chat).
+    await api.sendMessage('100', 'a', {})
+    stub.queueError('answerGuestQuery', make429Error(1))
+    const p = api.answerGuestQuery('gq', 'ответ', {})
+    await flushMicrotasks()
+    await clock.tick(1200)
+    await p
+    expect(stub.calls.filter((c) => c.method === 'answerGuestQuery').length).toBe(1)
   })
 })
 

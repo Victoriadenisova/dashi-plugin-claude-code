@@ -20,16 +20,22 @@
 
 import type { Logger } from '../log.js'
 import type {
+  AnswerGuestQueryOpts,
   ChatAction,
   DownloadResult,
   EditOpts,
   InlineKeyboardLike,
   SendDocumentOpts,
   SendMessageOpts,
+  SendRichMessageOpts,
+  SendRichMessageResult,
+  EditRichMessageResult,
   TelegramApi,
 } from '../channel/tools.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
+import { richErrorClass, isNotModifiedError } from '../format/rich.js'
+import type { RichLatch } from './rich-latch.js'
 
 /**
  * Walk an inline keyboard and redact every button's `text` and `url`
@@ -99,11 +105,19 @@ function redactReplyMarkup(
  * @param extraSecrets  Optional list of exact-substring secrets to mask
  *                      (e.g. webhook token, Groq key). Passed through to
  *                      redactSecrets on every send.
+ * @param richLatch     Optional M1 rich-message capability latch. When the
+ *                      rich send fails with a `capability` error we flip
+ *                      `sendDisabled` so subsequent rich attempts short-
+ *                      circuit to fallback without hitting Telegram. When
+ *                      omitted, sendRichMessage always reports `{ fallback }`
+ *                      (the layered chain then uses the HTML path) so a
+ *                      mis-wired build degrades safely instead of crashing.
  */
 export function createSafeTelegramApi(
   raw: TelegramApi,
   log: Logger,
   extraSecrets?: ReadonlyArray<string>,
+  richLatch?: RichLatch,
 ): TelegramApi {
   const sanitize = (
     text: string,
@@ -140,6 +154,95 @@ export function createSafeTelegramApi(
         safeOpts.reply_markup = redactReplyMarkup(safeOpts.reply_markup, extraSecrets)
       }
       return raw.sendMessage(chatId, safeText, safeOpts)
+    },
+
+    async sendRichMessage(
+      chatId: string,
+      rawMarkdown: string,
+      opts: SendRichMessageOpts,
+    ): Promise<SendRichMessageResult> {
+      // Latch already tripped (or no latch wired) → don't even attempt the
+      // send; report fallback so the caller uses the validated HTML path.
+      // Checked before redaction: a latched-off session would otherwise pay
+      // a full redaction pass on up-to-32KB text for every skipped call.
+      if (richLatch === undefined || richLatch.sendDisabled) {
+        return { fallback: true }
+      }
+
+      // Redact BEFORE the raw call — secrets must be stripped from the raw
+      // markdown before it leaves the process, exactly like the sendMessage
+      // path. We do NOT run validateTelegramHtml here: the body is markdown,
+      // not HTML, and the validator would corrupt it. Telegram's server-side
+      // parser is the safety net — a bad body comes back as a 400 we
+      // classify and fall back from.
+      const redacted = redactSecrets(rawMarkdown, extraSecrets)
+
+      try {
+        return await raw.sendRichMessage(chatId, redacted, opts)
+      } catch (err) {
+        const cls = richErrorClass(err)
+        if (cls === 'capability') {
+          // Telegram / this build can't do rich messages. Latch OFF for the
+          // session so we pay this failed call at most once, then fall back.
+          richLatch.sendDisabled = true
+          log.warn('rich message capability error — latching off, falling back to HTML', {
+            error: err instanceof Error ? err.message : String(err),
+          })
+          return { fallback: true }
+        }
+        if (cls === 'parser' || cls === 'oversize') {
+          // One-off body problem; the HTML path validates + chunks, so fall
+          // back without latching (other messages may be fine).
+          log.warn('rich message rejected — falling back to HTML', {
+            class: cls,
+            error: err instanceof Error ? err.message : String(err),
+          })
+          return { fallback: true }
+        }
+        // transient (network / 5xx / 429) — surface it. We must NOT fall back
+        // here: the rate-limit wrapper owns 429 retries, and swallowing a
+        // transient then sending via HTML risks a duplicate if the rich send
+        // actually landed. Re-throw so the reply tool's outer try reports it.
+        throw err
+      }
+    },
+
+    async editRichMessage(
+      chatId: string,
+      messageId: number,
+      rawMarkdown: string,
+    ): Promise<EditRichMessageResult> {
+      // Mirrors sendRichMessage's contract exactly — see that method for the
+      // reasoning behind each branch. Differences are called out inline.
+      if (richLatch === undefined || richLatch.sendDisabled) {
+        return { fallback: true }
+      }
+      const redacted = redactSecrets(rawMarkdown, extraSecrets)
+      try {
+        return await raw.editRichMessage(chatId, messageId, redacted)
+      } catch (err) {
+        // "Message is not modified" is a SUCCESSFUL no-op: the message on
+        // screen already shows exactly this rich body. Falling through to a
+        // legacy edit would repeat the same rejection AND flatten tables.
+        // Checked FIRST — Telegram returns it as a 400, which the classifier
+        // would otherwise read as a parser rejection. (Hermes _try_edit_rich.)
+        if (isNotModifiedError(err)) {
+          return { ok: true }
+        }
+        const cls = richErrorClass(err)
+        if (cls === 'capability') {
+          richLatch.sendDisabled = true
+          log.warn('rich edit unsupported — latched off for the session')
+          return { fallback: true }
+        }
+        if (cls === 'parser' || cls === 'oversize') {
+          return { fallback: true }
+        }
+        // Transient: the edit may ALREADY have landed. Re-throw instead of
+        // reporting fallback — a legacy retry here could fight a successful
+        // edit. The caller surfaces this as a tool error.
+        throw err
+      }
     },
 
     async editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void> {
@@ -205,6 +308,24 @@ export function createSafeTelegramApi(
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {
       return raw.deleteMessage(chatId, messageId)
+    },
+
+    async answerGuestQuery(
+      guestQueryId: string,
+      text: string,
+      opts: AnswerGuestQueryOpts,
+    ): Promise<void> {
+      // Guest answers land in a PUBLIC foreign chat — redaction here is the
+      // last line of defence, exactly like sendMessage. HTML downgrade
+      // follows the same rule: invalid Telegram HTML ships as plain text.
+      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
+      const safeOpts: AnswerGuestQueryOpts = { ...opts }
+      if (parseMode === undefined) {
+        delete safeOpts.parse_mode
+      } else {
+        safeOpts.parse_mode = parseMode
+      }
+      return raw.answerGuestQuery(guestQueryId, safeText, safeOpts)
     },
   }
 }

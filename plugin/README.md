@@ -134,6 +134,8 @@ bash plugin/scripts/install-hooks.sh \
 | `FALLBACK_REPLY_RETRY_ATTEMPTS` / `FALLBACK_REPLY_RETRY_DELAY_MS` | Ограниченный retry на пустую экстракцию (гонка extended-thinking: [thinking] и [text] в двух строках). Defaults 4 / 120ms, оба клампятся сверху. |
 | `TELEGRAM_MEMORY_*` | Memory hook config (см. секцию ниже). |
 | `TELEGRAM_MULTICHAT_*` | Multichat router config (см. секцию ниже). |
+| `ASK_GUARD_MODE` | Ask-guard (autonomy M3): `off` \| `advisory` \| `block`. Перекрывает `config.json` → `ask_guard.mode` (default `advisory`). При активном мандате перехватывает self-gating «жду го / дай добро»: `advisory` — шлёт ответ + hint, `block` — отказывает в отправке (агент действует сам или спрашивает карточкой AskUserQuestion). |
+| `ASK_GUARD_ENABLED` | Kill-switch ask-guard: `0`/`false`/`no`/`off` → полностью `off` (бьёт любой режим). |
 | `GROQ_API_KEY` | Whisper transcription для голосовых (опционально). |
 
 ## Memory hooks (опционально)
@@ -194,7 +196,7 @@ chats:
     max_queue_depth: 1                        # сколько inbound сообщений можно поставить в очередь (default 1)
 ```
 
-Per-chat persona-файл резолвится относительно `multichat.workspace_dir` — `PersonaManager` загружает его при первом сообщении и накладывает поверх единой Thrall identity. Никаких отдельных CLAUDE.md per chat не нужно.
+Per-chat persona-файл резолвится относительно `multichat.workspace_dir`. Оверлей накладывает SessionStart-хук `chats/hooks/session-start.sh`: он читает `{workspace}/chats/{chat_id}/persona.md` внутри tmux-сессии и инжектит поверх единой Thrall identity через `additionalContext`. Никаких отдельных CLAUDE.md per chat не нужно.
 
 Логи: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json` — JSON-pipe между плагином и tmux-сессией. Outbox dead-letter содержит сообщения которые не удалось отправить в Telegram даже после retry — оператор разбирает руками.
 
@@ -276,7 +278,7 @@ bash scripts/smoke-test-progress.sh --bot-id <expected_bot_id>
 - `bun test tests/hooks/` — hooks + claude-events + install-hooks + post-hook
 - `bun test tests/status/` — StatusManager, TmuxMirror, ProgressReporter, TaskMirror, ActivityRenderer
 - `bun test tests/router/` — MultichatRouter, TmuxSessionPool, inbox-bridge
-- `bun test tests/chats/` — PolicyLoader, PersonaManager
+- `bun test tests/chats/` — PolicyLoader, session-start persona-хук, multichat entrypoint
 - `bun run typecheck` — `tsc --noEmit` strict
 - `bash scripts/smoke-test-progress.sh` — end-to-end webhook + ProgressReporter check (см. секцию Smoke test выше)
 

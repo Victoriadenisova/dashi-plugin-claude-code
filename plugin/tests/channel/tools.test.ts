@@ -6,6 +6,7 @@ import { join } from 'path'
 import {
   callTool,
   listTools,
+  type AnswerGuestQueryOpts,
   type CallToolRequest,
   type DownloadResult,
   type EditOpts,
@@ -23,6 +24,10 @@ const silentLog = createLogger('test', { stream: { write: () => true } as unknow
 function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
   return {
     sendMessage: async (_chatId: string, _text: string, _opts: SendMessageOpts) => ({ message_id: 1 }),
+    // Default rich stub reports fallback so legacy reply tests (richMessages
+    // disabled in makeConfig) never accidentally exercise the rich path.
+    sendRichMessage: async () => ({ fallback: true as const }),
+    editRichMessage: async () => ({ fallback: true as const }),
     editMessageText: async (_chatId: string, _messageId: number, _text: string, _opts: EditOpts) => {
       /* noop */
     },
@@ -39,6 +44,9 @@ function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
       size: 0,
     }),
     deleteMessage: async (_chatId: string, _messageId: number) => {
+      /* noop */
+    },
+    answerGuestQuery: async (_guestQueryId: string, _text: string, _opts: AnswerGuestQueryOpts) => {
       /* noop */
     },
     ...overrides,
@@ -86,6 +94,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
     ...overrides,
   }
 }
@@ -104,6 +113,7 @@ function makeStatePaths(): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
@@ -144,7 +154,7 @@ function callReq(name: string, args: Record<string, unknown>): CallToolRequest {
 }
 
 describe('listTools', () => {
-  test('returns 5 tools with stable order: reply, react, download_attachment, edit_message, status', () => {
+  test('returns 6 tools with stable order: reply, react, download_attachment, edit_message, status, autonomy', () => {
     const tools = listTools()
     expect(tools.map(t => t.name)).toEqual([
       'reply',
@@ -152,7 +162,13 @@ describe('listTools', () => {
       'download_attachment',
       'edit_message',
       'status',
+      'autonomy',
     ])
+  })
+
+  test('autonomy tool input schema requires chat_id and action', () => {
+    const autonomy = listTools().find(t => t.name === 'autonomy')
+    expect(autonomy?.inputSchema.required).toEqual(['chat_id', 'action'])
   })
 
   test('reply tool input schema requires chat_id and text', () => {
@@ -380,6 +396,28 @@ describe('callTool', () => {
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 
+  test('reply format=rich accepts new enum value (falls back to HTML when richMessages disabled)', async () => {
+    // Schema regression: 'rich' must be a legal format value (M1). With the
+    // default makeConfig (richMessages.enabled=false) no rich send is
+    // attempted — the body renders via the validated HTML path, parse_mode=HTML.
+    const captured: Array<{ text: string; opts: SendMessageOpts }> = []
+    const api = makeStubApi({
+      sendMessage: async (_chatId, text, opts) => {
+        captured.push({ text, opts })
+        return { message_id: 700 + captured.length }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: '# Title', format: 'rich' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured).toHaveLength(1)
+    expect(captured[0]?.opts.parse_mode).toBe('HTML')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
   test('reply without explicit format defaults to html (markdown auto-converts)', async () => {
     // Regression: when the caller omits `format`, the schema defaults to
     // 'html'. The body should be markdown-converted and sent with
@@ -523,6 +561,298 @@ describe('callTool', () => {
     expect(result.isError).toBeUndefined()
     expect(captured).not.toBeNull()
     expect(captured!.fileId).toBe('AgAD...')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// autonomy tool (PR-1). READ + resolve over the durable registry; it can
+// NEVER grant a lease (granting arrives in PR-2 via the button relay).
+// ─────────────────────────────────────────────────────────────────────
+
+import {
+  addLease,
+  addQuestion,
+  emptyAutonomyState,
+  loadAutonomyState,
+  saveAutonomyState,
+} from '../../src/autonomy/store.js'
+
+const OWNER_CHAT = '164795011'
+const HOUR = 3_600_000
+
+describe('autonomy tool', () => {
+  test('status on empty registry → "nothing active" text', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'status' }), deps)
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]?.text).toContain('Активных мандатов нет')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('status reflects a lease seeded through the store API', async () => {
+    const deps = makeDeps()
+    const seeded = addLease(
+      emptyAutonomyState(),
+      { id: 'L-seed', scope: 'ship the wave', expiresAtMs: Date.now() + 4 * HOUR, source: 'ask_card' },
+      Date.now(),
+    ).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, seeded)
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'status' }), deps)
+    expect(res.content[0]?.text).toContain('L-seed')
+    expect(res.content[0]?.text).toContain('ship the wave')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume marks the lease consumed on disk', async () => {
+    const deps = makeDeps()
+    const seeded = addLease(
+      emptyAutonomyState(),
+      { id: 'L-c', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' },
+      Date.now(),
+    ).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, seeded)
+
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-c' }), deps)
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]?.text).toContain('lease consumed: L-c')
+
+    const after = loadAutonomyState(deps.statePaths, OWNER_CHAT)
+    expect(after.leases[0]?.consumedAtMs).toBeGreaterThan(0)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume unknown lease → error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-nope' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease not found')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume already-consumed lease → error', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-c', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-c' }), deps)
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-c' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('already consumed')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume without lease_id → schema error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease_id')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('resolve_question sets status on disk', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addQuestion(emptyAutonomyState(), { id: 'Q-1', summary: 'deploy?', askedAtMs: Date.now() }, Date.now()).state,
+    )
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-1', resolution: 'answered' }),
+      deps,
+    )
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]?.text).toContain('Q-1 resolved: answered')
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).questions[0]?.status).toBe('answered')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('resolve_question unknown id → error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-x', resolution: 'answered' }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('question not found')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('resolve_question missing question_id/resolution → schema error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question' }), deps)
+    expect(res.isError).toBe(true)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('CANNOT grant: there is no grant action (enum rejects it)', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'grant', scope: 'x' }), deps)
+    expect(res.isError).toBe(true)
+    // No file is created / no lease appears.
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).leases).toEqual([])
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('rejects a non-allowlisted chat', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: '999999', action: 'status' }), deps)
+    expect(res.isError).toBe(true)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// Fix-loop 2026-07-10: serialization, expired honesty, sticky/final invariants.
+describe('autonomy tool — fix-loop invariants', () => {
+  test('two PARALLEL consume calls → exactly one ok, one already_consumed', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-par', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    const call = () =>
+      callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-par' }), deps)
+    const [a, b] = await Promise.all([call(), call()])
+    const oks = [a, b].filter((r) => r.isError === undefined)
+    const errs = [a, b].filter((r) => r.isError === true)
+    expect(oks.length).toBe(1)
+    expect(errs.length).toBe(1)
+    expect(errs[0]?.content[0]?.text).toContain('already consumed')
+    // Disk agrees: consumed exactly once.
+    const final = loadAutonomyState(deps.statePaths, OWNER_CHAT)
+    expect(final.leases.filter((l) => l.consumedAtMs != null).length).toBe(1)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume of an EXPIRED lease → honest error, not success', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-exp', scope: 's', expiresAtMs: Date.now() - 1, source: 'manual' }, Date.now() - HOUR).state,
+    )
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-exp' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease expired')
+    // Not marked consumed on disk.
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).leases[0]?.consumedAtMs).toBe(null)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('bypassing a STICKY question → refused with sticky error', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addQuestion(emptyAutonomyState(), { id: 'Q-st', summary: 'wipe db?', askedAtMs: Date.now(), sticky: true }, Date.now()).state,
+    )
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-st', resolution: 'bypassed' }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('sticky')
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).questions[0]?.status).toBe('open')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('re-resolving an already-resolved question → error', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addQuestion(emptyAutonomyState(), { id: 'Q-f', summary: 's', askedAtMs: Date.now() }, Date.now()).state,
+    )
+    const first = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-f', resolution: 'answered' }),
+      deps,
+    )
+    expect(first.isError).toBeUndefined()
+    const second = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-f', resolution: 'bypassed' }),
+      deps,
+    )
+    expect(second.isError).toBe(true)
+    expect(second.content[0]?.text).toContain('already resolved')
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).questions[0]?.status).toBe('answered')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// Fix-loop-2 (Sol): revoke action, revoked-consume, writer_conflict surface.
+import { revokeLease, WRITER_LOCK_FILENAME } from '../../src/autonomy/store.js'
+import { writeFileSync as wfsTools } from 'node:fs'
+
+describe('autonomy tool — fix-loop-2', () => {
+  test('revoke: withdraws an active lease (revokedBy=agent, reason stored)', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-rv', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke', lease_id: 'L-rv', reason: 'scope drift' }),
+      deps,
+    )
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]?.text).toContain('lease revoked: L-rv')
+    const lease = loadAutonomyState(deps.statePaths, OWNER_CHAT).leases[0]
+    expect(lease?.revokedBy).toBe('agent')
+    expect(lease?.revokeReason).toBe('scope drift')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('revoke without lease_id → schema error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease_id')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume of a revoked lease → honest "revoked" error', async () => {
+    const deps = makeDeps()
+    const seeded = addLease(emptyAutonomyState(), { id: 'L-rv2', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, revokeLease(seeded, 'L-rv2', Date.now(), 'owner').state)
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-rv2' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease revoked')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('revoke of an already-revoked lease → error; of a consumed lease → error', async () => {
+    const deps = makeDeps()
+    const base = addLease(emptyAutonomyState(), { id: 'L-a', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, revokeLease(base, 'L-a', Date.now(), 'owner').state)
+    const again = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke', lease_id: 'L-a' }), deps)
+    expect(again.isError).toBe(true)
+    expect(again.content[0]?.text).toContain('already revoked')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('fresh foreign writer lock → mutation refused with writer_conflict text', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-wl', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    wfsTools(
+      join(deps.statePaths.root, WRITER_LOCK_FILENAME),
+      JSON.stringify({ writerId: 'feedfacedeadbeef', pid: 99999, refreshedAtMs: Date.now() }),
+      'utf8',
+    )
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-wl' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('writer_conflict')
+    // The lease is untouched — and status (read-only) still works.
+    const status = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'status' }), deps)
+    expect(status.isError).toBeUndefined()
+    expect(status.content[0]?.text).toContain('L-wl')
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 })

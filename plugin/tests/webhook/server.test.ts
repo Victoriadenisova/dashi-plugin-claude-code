@@ -1044,3 +1044,244 @@ describe('POST /hooks/agent — memoryWriter branch (Phase 8 T7)', () => {
     expect(mcp.calls.length).toBe(1)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Status pin (2026-07-04): permission_mode capture + HUD todo dispatch
+// ─────────────────────────────────────────────────────────────────────
+
+describe('POST /hooks/agent — status-pin wiring', () => {
+  test('a synchronously-throwing HUD never breaks the 200 path', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      contextHud: {
+        onSessionStart: () => {
+          throw new Error('sync boom')
+        },
+        onStop: () => {
+          throw new Error('sync boom')
+        },
+        onTodoEvent: () => {
+          throw new Error('sync boom')
+        },
+      },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    for (const body of [
+      { hook_event_name: 'SessionStart', model: 'fable', source: 'startup' },
+      {
+        hook_event_name: 'PostToolUse', tool_name: 'TodoWrite', tool_use_id: 'u1',
+        tool_input: { todos: [{ content: 'x', status: 'pending' }] }, tool_result: 'ok',
+      },
+      { hook_event_name: 'Stop' },
+    ]) {
+      const resp = await fetch(url(h, '/hooks/agent'), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chatId: 164795011,
+          session_id: 's1',
+          transcript_path: '/tmp/t.jsonl',
+          cwd: '/tmp',
+          ...body,
+        }),
+      })
+      expect(resp.status).toBe(200)
+    }
+  })
+
+  test('permission_mode is recorded; TodoWrite reaches contextHud.onTodoEvent', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const recorded: Array<{ chatId: string | undefined; info: Record<string, unknown> }> = []
+    const todoEvents: Array<{ chatId: string; event: { kind: string } }> = []
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      sessionInfo: {
+        record: (chatId, info) => {
+          recorded.push({ chatId, info: info as Record<string, unknown> })
+        },
+      },
+      contextHud: {
+        onSessionStart: () => {},
+        onStop: () => {},
+        onTodoEvent: (chatId, event) => {
+          todoEvents.push({ chatId, event })
+        },
+      },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'PostToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        permission_mode: 'plan',
+        tool_name: 'TodoWrite',
+        tool_use_id: 'u1',
+        tool_input: {
+          todos: [{ content: 'шаг', status: 'in_progress', activeForm: 'делаю шаг' }],
+        },
+        tool_result: 'ok',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(recorded.length).toBe(1)
+    expect(recorded[0]!.info.permissionMode).toBe('plan')
+    // fire-and-forget dispatch — give the microtask queue one tick
+    await new Promise((r) => setTimeout(r, 10))
+    expect(todoEvents.length).toBe(1)
+    expect(todoEvents[0]!.chatId).toBe('164795011')
+    expect(todoEvents[0]!.event.kind).toBe('todo_write')
+  })
+
+  test('model is captured from a Stop hook (mid-session model switch)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const recorded: Array<{ chatId: string | undefined; info: Record<string, unknown> }> = []
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      sessionInfo: {
+        record: (chatId, info) => {
+          recorded.push({ chatId, info: info as Record<string, unknown> })
+        },
+      },
+      contextHud: { onSessionStart: () => {}, onStop: () => {}, onTodoEvent: () => {} },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        model: 'claude-fable-5',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(recorded.length).toBe(1)
+    // The Stop hook now feeds model into SessionInfoStore so the HUD follows a
+    // mid-session model switch and resolves the 1M Fable window.
+    expect(recorded[0]!.info.model).toBe('claude-fable-5')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// M3 reality mirror dispatch
+// ─────────────────────────────────────────────────────────────────────
+
+describe('taskRealityMirror dispatch', () => {
+  interface RmCall { m: string; chatId: string; extra?: unknown }
+
+  function makeRealityStub(): { rm: any; calls: RmCall[] } {
+    const calls: RmCall[] = []
+    const rm = {
+      onSessionStart: (chatId: string, o: unknown) => calls.push({ m: 'onSessionStart', chatId, extra: o }),
+      onUserPromptSubmit: (chatId: string, o: unknown) => calls.push({ m: 'onUserPromptSubmit', chatId, extra: o }),
+      onStop: (chatId: string) => calls.push({ m: 'onStop', chatId }),
+      onSessionEnd: (chatId: string, o: unknown) => calls.push({ m: 'onSessionEnd', chatId, extra: o }),
+      onTaskEvent: (chatId: string, ev: unknown, o: unknown) => calls.push({ m: 'onTaskEvent', chatId, extra: { ev, o } }),
+    }
+    return { rm, calls }
+  }
+
+  function makeTaskMirrorStub(): { tm: any; recorded: string[] } {
+    const state = { tm: undefined as any, recorded: [] as string[] }
+    state.tm = {
+      recordEvent: async (_chatId: string, event: { kind: string }) => {
+        state.recorded.push(event.kind)
+      },
+    }
+    return state
+  }
+
+  async function post(h: WebhookServerHandle, body: Record<string, unknown>): Promise<number> {
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${WEBHOOK_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return resp.status
+  }
+
+  const common = { chatId: 164795011, session_id: 's1', transcript_path: '/tmp/t.jsonl', cwd: '/repo' }
+
+  test('lifecycle hooks route to the reality mirror; mutations bypass taskMirror', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { rm, calls } = makeRealityStub()
+    const tm = makeTaskMirrorStub()
+    const mcp = makeMcpStub()
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      taskMirror: tm.tm,
+      taskRealityMirror: rm,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    expect(await post(h, { ...common, hook_event_name: 'SessionStart', source: 'startup' })).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'UserPromptSubmit', prompt: 'x' })).toBe(200)
+    expect(
+      await post(h, {
+        ...common,
+        hook_event_name: 'PostToolUse',
+        tool_name: 'TaskCreate',
+        tool_use_id: 'u1',
+        tool_input: { subject: 'Build the thing' },
+        tool_result: 'Task #1 created successfully',
+      }),
+    ).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'Stop' })).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'SessionEnd', reason: 'clear' })).toBe(200)
+
+    const kinds = calls.map((c) => c.m)
+    expect(kinds).toContain('onSessionStart')
+    expect(kinds).toContain('onUserPromptSubmit')
+    expect(kinds).toContain('onTaskEvent')
+    expect(kinds).toContain('onStop')
+    expect(kinds).toContain('onSessionEnd')
+    // cwd threaded through
+    expect((calls.find((c) => c.m === 'onSessionStart')!.extra as any).cwd).toBe('/repo')
+    // MUTATIONS bypass the direct taskMirror path (the reconciler owns content),
+    // but LIFECYCLE events still reach it so finalize/eviction/tombstones fire.
+    expect(tm.recorded).not.toContain('task_create')
+    expect(tm.recorded).not.toContain('todo_write')
+    expect(tm.recorded).toContain('session_start')
+    expect(tm.recorded).toContain('session_end')
+  })
+})

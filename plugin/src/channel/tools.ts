@@ -1,7 +1,8 @@
 // MCP tool surface for the Telegram channel.
 //
-// 5 tools: reply, react, download_attachment, edit_message, status.
-// Status is currently a stub (returns not_implemented) — T11 will wire it.
+// 6 tools: reply, react, download_attachment, edit_message, status, autonomy.
+// `autonomy` (PR-1) is a READ + resolve surface over the durable autonomy
+// registry (leases + open questions); it can never GRANT a lease.
 //
 // All tool args are validated through Zod schemas; we never reach into
 // `req.params.arguments` with `as Record<string, unknown>` casts. If a
@@ -17,23 +18,48 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
+import { resolveAskGuardMode } from '../config.js'
 import type { Logger } from '../log.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
 import {
+  AutonomyArgsSchema,
   DownloadAttachmentArgsSchema,
   EditMessageArgsSchema,
   ReactArgsSchema,
   ReplyArgsSchema,
   StatusArgsSchema,
 } from '../schemas.js'
+import {
+  activeLeases,
+  consumeLease,
+  loadAutonomyState,
+  renderAutonomyStatus,
+  resolveQuestion,
+  revokeLease,
+  updateAutonomyState,
+  type UpdateResult,
+} from '../autonomy/store.js'
+import { analyzeAskDetailed, askGuardAdvisoryHint, askGuardBlockMessage } from '../safety/ask-guard.js'
 import { assertAllowedChat } from '../telegram/gate.js'
+import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
 } from '../format/html.js'
 import { splitMessage } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
+import {
+  buildRichMessagePayload,
+  buildRichEditPayload,
+  contentFitsRichLimits,
+  hardenSoftBreaks,
+  needsRichRendering,
+  hasDetailsMathCrashShape,
+  hasCjkGarbleShape,
+} from '../format/rich.js'
+import { analyzeFormat, formatHint } from '../format/format-check.js'
+import type { RichLatch } from '../safety/rich-latch.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // MCP request/response types we touch. We narrow rather than import deep
@@ -83,6 +109,13 @@ export interface SendMessageOpts {
   reply_to_message_id?: number
   parse_mode?: 'MarkdownV2' | 'HTML'
   reply_markup?: InlineKeyboardLike
+  // M4 fix-loop-1 #6: opt OUT of the reliable layer's outbound-activity stamp.
+  // Set by INTERNAL status surfaces (context-HUD sends, heartbeat nudges)
+  // whose messages must not count as «the owner heard a real report» —
+  // otherwise a pin self-heal would silently reset the heartbeat silence
+  // window. Consumed and STRIPPED by createReliableTelegramApi; never reaches
+  // the wire.
+  skipOutboundStamp?: boolean
 }
 
 export interface EditOpts {
@@ -100,6 +133,25 @@ export interface SendDocumentOpts {
   reply_to_message_id?: number
   caption?: string
 }
+
+// Options for the rich-message send. Threading only for M1; M3/M4 extend.
+export interface SendRichMessageOpts {
+  reply_to_message_id?: number
+}
+
+// Result of a rich send. Either Telegram accepted it (we got a message_id)
+// or the layered wrapper decided to fall back to the HTML path. `fallback`
+// is the signal the reply tool reads to decide whether to also run the HTML
+// chunk path — exactly one of the two ships, so a message is never lost or
+// duplicated.
+export type SendRichMessageResult = { message_id: number } | { fallback: true }
+
+// Result of a rich in-place EDIT. `ok` means the message on screen now shows
+// the rich body (including the "not modified" no-op — it already did).
+// `fallback` means the caller should retry the edit through the legacy path.
+// A TRANSIENT failure is NOT represented here: it throws, because the edit
+// may already have landed and a legacy retry would fight it.
+export type EditRichMessageResult = { ok: true } | { fallback: true }
 
 export interface DownloadResult {
   path: string
@@ -120,8 +172,33 @@ export type ChatAction =
   | 'record_video_note'
   | 'upload_video_note'
 
+// Options for the one-shot guest answer (Guest Mode, Bot API 10.0).
+export interface AnswerGuestQueryOpts {
+  parse_mode?: 'MarkdownV2' | 'HTML'
+}
+
 export interface TelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
+  // Telegram Bot API 10.1 Rich Messages: ship RAW markdown that Telegram
+  // renders server-side (tables/math/headings/task-lists/<details>/footnotes,
+  // up to 32768 bytes). The result is either a message_id (sent) or
+  // { fallback: true } (caller must use the HTML path instead). Implemented
+  // via grammY's raw escape hatch; redaction runs in the safe wrapper BEFORE
+  // the raw send — never call this from outside the layered chain.
+  sendRichMessage(
+    chatId: string,
+    rawMarkdown: string,
+    opts: SendRichMessageOpts,
+  ): Promise<SendRichMessageResult>
+  // Bot API 10.1 rich EDIT: re-render a message already on screen as rich,
+  // in place. Same body as sendRichMessage plus message_id; no topic routing
+  // (Telegram rejects a rich edit that carries it). Redaction runs in the
+  // safe wrapper BEFORE the raw call, exactly like the send path.
+  editRichMessage(
+    chatId: string,
+    messageId: number,
+    rawMarkdown: string,
+  ): Promise<EditRichMessageResult>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
   sendChatAction(chatId: string, action: ChatAction): Promise<void>
@@ -129,7 +206,25 @@ export interface TelegramApi {
   sendPhoto(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }>
   downloadFile(fileId: string, destDir: string): Promise<DownloadResult>
   deleteMessage(chatId: string, messageId: number): Promise<void>
+  // Guest Mode: answer a guest @-mention exactly once. Telegram's contract
+  // takes an InlineQueryResult; we constrain the surface to a text article
+  // — the only shape the reply tool emits — so stubs stay trivial.
+  answerGuestQuery(guestQueryId: string, text: string, opts: AnswerGuestQueryOpts): Promise<void>
 }
+
+// grammY ^1.21.0 has no typed `sendRichMessage` on its RawApi (the method is
+// newer than the bundled types). We reach it through the raw escape hatch
+// `bot.api.raw`, narrowed to a typed function rather than `any`: the body is
+// the RichMessageBody buildRichMessagePayload produces, and the response is
+// the small shape we read message_id from (defensively — Telegram nests it
+// under `result`, grammY usually unwraps to the top level).
+interface RawSendRichResponse {
+  message_id?: number
+  result?: { message_id?: number }
+}
+type RawSendRichMessageFn = (
+  body: Record<string, unknown>,
+) => Promise<RawSendRichResponse>
 
 // Thin wrapper around grammY bot.api. Keeps the rest of the system free of
 // grammy-specific quirks (reply_parameters vs reply_to_message_id, etc).
@@ -148,6 +243,47 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       }
       const sent = await bot.api.sendMessage(chatId, text, other)
       return { message_id: sent.message_id }
+    },
+    async sendRichMessage(chatId, rawMarkdown, opts) {
+      // Build the raw-api body (chat_id + markdown + reply_parameters) and
+      // dispatch through grammY's untyped raw escape hatch. The safe wrapper
+      // already redacted `rawMarkdown`; this layer only transports it.
+      const body = buildRichMessagePayload(rawMarkdown, {
+        chat_id: chatId,
+        ...(opts.reply_to_message_id !== undefined
+          ? { reply_to_message_id: opts.reply_to_message_id }
+          : {}),
+      })
+      // `bot.api.raw` is typed to known methods only; cast through unknown to
+      // a typed function for the (still-untyped-in-grammY) sendRichMessage.
+      const rawApi = bot.api.raw as unknown as Record<string, unknown>
+      const sendRich = rawApi.sendRichMessage as RawSendRichMessageFn
+      const res = await sendRich(body as unknown as Record<string, unknown>)
+      // Parse message_id defensively: top-level (grammY-unwrapped) first,
+      // then nested under `result` (raw Bot API envelope).
+      const messageId = res.message_id ?? res.result?.message_id
+      if (typeof messageId !== 'number') {
+        throw new Error('sendRichMessage returned no message_id')
+      }
+      return { message_id: messageId }
+    },
+    async editRichMessage(chatId, messageId, rawMarkdown) {
+      // Same raw escape hatch as sendRichMessage: grammY has no typed
+      // editMessageText.rich_message. The safe wrapper already redacted the
+      // markdown; this layer only transports it.
+      const body = buildRichEditPayload(rawMarkdown, {
+        chat_id: chatId,
+        message_id: messageId,
+      })
+      const rawApi = bot.api.raw as unknown as Record<string, unknown>
+      const editRich = rawApi.editMessageText as unknown as (
+        b: Record<string, unknown>,
+      ) => Promise<unknown>
+      await editRich(body as unknown as Record<string, unknown>)
+      // Telegram answers with the edited Message (or `true` for some shapes).
+      // We deliberately do NOT parse it: a post-edit parse quirk must not be
+      // mistaken for a failed edit and trigger a duplicate legacy edit.
+      return { ok: true }
     },
     async editMessageText(chatId, messageId, text, opts) {
       const other: Record<string, unknown> = {}
@@ -199,6 +335,20 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       writeFileSync(path, buf)
       return { path, size: buf.length }
     },
+    async answerGuestQuery(guestQueryId, text, opts) {
+      // answerGuestQuery takes an InlineQueryResult; a text answer is an
+      // article with InputTextMessageContent. `id` is scoped to the query
+      // (one result per answer), so a constant is fine.
+      await bot.api.answerGuestQuery(guestQueryId, {
+        type: 'article',
+        id: 'answer',
+        title: 'Ответ',
+        input_message_content: {
+          message_text: text,
+          ...(opts.parse_mode !== undefined ? { parse_mode: opts.parse_mode } : {}),
+        },
+      })
+    },
   }
 }
 
@@ -211,12 +361,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'reply',
     description:
-      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no attachments, no reply_to, single message ≤4096 chars — be concise).',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string' },
         text: { type: 'string' },
+        guest_query_id: {
+          type: 'string',
+          description:
+            'Guest Mode only: the guest_query_id from the inbound <channel> meta. When set, the reply goes through answerGuestQuery (one-shot) instead of sendMessage.',
+        },
         reply_to: {
           type: 'string',
           description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
@@ -229,10 +384,10 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
         format: {
           type: 'string',
-          enum: ['text', 'markdownv2', 'html'],
+          enum: ['text', 'markdownv2', 'html', 'rich'],
           default: 'html',
           description:
-            "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules.",
+            "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules. 'rich' is never required: DM replies auto-upgrade to Telegram's native markdown rendering when available; the explicit value just forces the same gate.",
         },
       },
       required: ['chat_id', 'text'],
@@ -255,12 +410,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'download_attachment',
     description:
-      'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Pass chat_id from the SAME inbound <channel> block so the tool can verify the file came from an allowlisted chat. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      'Download a file attachment from a Telegram message to the local inbox. Use when a <media> tag shows a file_id but no local_path. Pass chat_id from the SAME inbound <channel> block so the tool can verify the file came from an allowlisted chat. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id too — it authorizes fetching a file_id from the foreign chat the bot was @-mentioned in (that chat is not on the allowlist). You may call this several times for one guest turn; it does not consume the one-shot reply.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'The chat_id from inbound meta' },
-        file_id: { type: 'string', description: 'The attachment_file_id from inbound meta' },
+        file_id: { type: 'string', description: 'The file_id from a <media> descriptor or inbound meta' },
+        guest_query_id: {
+          type: 'string',
+          description:
+            'Guest Mode only: the guest_query_id from the inbound <channel> meta. When set, authorization is the guest-query registry instead of the chat allowlist.',
+        },
       },
       required: ['chat_id', 'file_id'],
     },
@@ -309,6 +469,39 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       required: ['chat_id', 'state'],
     },
   },
+  {
+    name: 'autonomy',
+    description:
+      'Inspect and resolve the durable autonomy registry for a chat — the owner-granted mandates (leases) that survive context compaction, plus open questions to the owner. Pass chat_id from the inbound <channel> meta. action="status" returns active leases (id, scope, time left) and open questions (id, summary, age, default action, sticky flag). action="consume" marks a lease consumed (pass lease_id). action="revoke" withdraws a lease\'s authority (pass lease_id, optional reason) — self-revoke only shrinks authority. action="resolve_question" sets a question answered/bypassed (pass question_id and resolution). This tool CANNOT grant a lease — grants come from the owner via the authenticated button flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string' },
+        action: {
+          type: 'string',
+          enum: ['status', 'consume', 'revoke', 'resolve_question'],
+        },
+        lease_id: {
+          type: 'string',
+          description: 'Required when action="consume" or action="revoke". The lease id (e.g. L-20260710-a1b2c3d4).',
+        },
+        reason: {
+          type: 'string',
+          description: 'Optional short reason for action="revoke" (stored as revokeReason).',
+        },
+        question_id: {
+          type: 'string',
+          description: 'Required when action="resolve_question". The question id (e.g. Q-20260710-a1b2).',
+        },
+        resolution: {
+          type: 'string',
+          enum: ['answered', 'bypassed'],
+          description: 'Required when action="resolve_question". How the question was resolved.',
+        },
+      },
+      required: ['chat_id', 'action'],
+    },
+  },
 ]
 
 export function listTools(): ToolDefinition[] {
@@ -329,6 +522,25 @@ export interface ToolDeps {
   // H4 fix (2026-05-23): when multichat is enabled, the policy is the
   // authoritative outbound allowlist. Omitted in legacy DM-only mode.
   policy?: MultichatPolicy
+  // Guest Mode (2026-07-04): pending one-shot guest queries. Authorization
+  // for a guest reply is registry membership — only allowlisted callers'
+  // queries are ever registered (handleGuestMessage gates first), so the
+  // chat allowlist is deliberately NOT consulted on this path.
+  guestQueries?: GuestQueryRegistry
+  // M1 rich messages (2026-06-14): session-scoped capability latch shared
+  // with the safe-telegram-api wrapper. The reply handler reads
+  // `sendDisabled` to skip rich attempts cheaply once a capability error has
+  // latched it off. Optional so existing test fixtures that omit it keep the
+  // legacy HTML-only behaviour (rich is then never attempted).
+  richLatch?: RichLatch
+}
+
+// DM detection: a Telegram DM chat.id equals the user's id and is positive.
+// Groups/supergroups/channels are negative. M1 ships rich messages to DMs
+// only (groups are M4). Non-numeric / NaN ids fail closed (not a DM).
+export function isDmChat(chatId: string): boolean {
+  const n = Number(chatId)
+  return Number.isFinite(n) && n > 0
 }
 
 function toolError(name: string, message: string): CallToolResult {
@@ -353,11 +565,201 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = ReplyArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
+
+        // Guest Mode path (2026-07-04). Authorization = registry membership
+        // (only allowlisted callers' queries get registered), NOT the chat
+        // allowlist — the originating chat is one the bot is not a member
+        // of, so assertAllowedChat would always (correctly) refuse it.
+        if (args.guest_query_id !== undefined) {
+          if (deps.guestQueries === undefined) {
+            return toolError(name, 'guest replies unavailable — guest_mode is not enabled in config')
+          }
+          if ((args.files ?? []).length > 0) {
+            return toolError(name, 'guest replies cannot carry attachments — answerGuestQuery is text-only')
+          }
+          if (args.reply_to !== undefined) {
+            return toolError(name, 'guest replies do not support reply_to — the answer always lands in-place')
+          }
+
+          // Render BEFORE claiming (Fable #4): a renderer throw after
+          // claim() would strand the one-shot entry inflight until TTL.
+          // Hard-cap at ONE Telegram message: there is no second
+          // answerGuestQuery, so chunking cannot apply — ship chunk[0] and
+          // flag the truncation in the tool result so the agent knows.
+          // 'rich' degrades to the HTML rendering here: answerGuestQuery has
+          // no rich_message payload, and raw markdown in a public foreign
+          // chat reads worse than our rendered HTML subset.
+          const guestFormat = args.format === 'rich' ? 'html' : args.format
+          const body =
+            guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
+          const chunks = splitMessage(body)
+          const single = chunks[0]
+          if (single === undefined) {
+            return toolError(name, 'guest reply rendered to an empty message — nothing to send')
+          }
+          const truncated = chunks.length > 1
+          // Plain-text fallback body: the PRE-render text (Fable #3) — a
+          // parse failure means our markup was bad, and raw <b> tag soup in
+          // a public foreign chat reads worse than unrendered markdown.
+          const plainBody = splitMessage(args.text)[0] ?? single
+          const guestOpts: AnswerGuestQueryOpts =
+            guestFormat === 'html'
+              ? { parse_mode: 'HTML' }
+              : guestFormat === 'markdownv2'
+                ? { parse_mode: 'MarkdownV2' }
+                : {}
+
+          const claim = deps.guestQueries.claim(args.guest_query_id)
+          if (claim.kind !== 'ok') {
+            return toolError(
+              name,
+              `guest query ${claim.kind} — guest answers are one-shot and expire after 15 minutes`,
+            )
+          }
+          // Cheap LLM-mixup guard (Fable #5): with two pending guest
+          // queries in different foreign chats, a swapped (chat_id,
+          // guest_query_id) pair would deliver chat A's answer into chat B
+          // — both public. The registry knows the true origin; refuse loud.
+          if (
+            claim.entry.callerChatId !== undefined &&
+            claim.entry.callerChatId !== args.chat_id
+          ) {
+            deps.guestQueries.release(args.guest_query_id)
+            return toolError(
+              name,
+              `guest query ${args.guest_query_id} originated in chat ${claim.entry.callerChatId}, not ${args.chat_id} — pass the chat_id from the SAME inbound <channel> meta`,
+            )
+          }
+
+          try {
+            await telegramApi.answerGuestQuery(args.guest_query_id, single, guestOpts)
+          } catch (err) {
+            // Entity-parse failures are format-agnostic (Fable #2):
+            // Telegram raises the same «can't parse entities» family for
+            // HTML and MarkdownV2 bodies — and a chunked MarkdownV2 body
+            // can be INVALID by construction (splitMessage balances only
+            // HTML tags), so without this retry a long markdownv2 guest
+            // reply would burn the query's TTL on identical failures.
+            // A failed call does not consume the query on Telegram's side.
+            if (guestOpts.parse_mode !== undefined && isTelegramHtmlParseError(err)) {
+              log.warn('guest answer entity parse failed, retrying as plain text', {
+                format: args.format,
+                error: err instanceof Error ? err.message : String(err),
+              })
+              try {
+                await telegramApi.answerGuestQuery(args.guest_query_id, plainBody, {})
+              } catch (err2) {
+                deps.guestQueries.release(args.guest_query_id)
+                return toolError(name, err2 instanceof Error ? err2.message : String(err2))
+              }
+            } else {
+              deps.guestQueries.release(args.guest_query_id)
+              return toolError(name, err instanceof Error ? err.message : String(err))
+            }
+          }
+
+          // Send succeeded — freeze the entry as answered so a repeat
+          // reply reads 'consumed' and cap-eviction may reclaim the slot.
+          deps.guestQueries.confirm(args.guest_query_id)
+
+          return {
+            content: [{
+              type: 'text',
+              text: truncated
+                ? 'guest answer sent (TRUNCATED to one message — guest replies are one-shot; keep them short)'
+                : 'guest answer sent',
+            }],
+          }
+        }
+
         try {
           assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
+
+        // ── Ask-guard (autonomy M3) ──────────────────────────────────────
+        // Enforces owner-granted autonomy mandates on the OWNER-egress
+        // `reply`-tool path. When an ACTIVE lease exists for this chat AND the
+        // outgoing body is a self-gating permission-ask («жду го / дай добро»),
+        // intercept:
+        //   * block mode  → refuse the send (isError, nothing shipped). NO
+        //                   resend-valve — an identical re-send is analyzed
+        //                   the same way and blocked again (analyzeAsk is
+        //                   pure/stateless).
+        //   * advisory    → the reply still ships; a hint is appended to the
+        //                   tool result (computed here, attached near the
+        //                   result below) nudging act-with-veto.
+        // SCOPE (fix-loop #9 — honest coverage): this guards ONLY the `reply`
+        // tool. The guest path returns above; `edit_message` is UNGUARDED BY
+        // DESIGN (interim progress edits are not owner-egress go-questions); the
+        // AskUserQuestion relay is a different tool (the legitimate escape). The
+        // DM Stop-hook fallback route (POST /hooks/fallback-reply) runs the SAME
+        // analyzeAsk guard so a turn's final text cannot bypass this via the
+        // fallback. Fail-open on ANY error — a guard fault must never gate a
+        // real reply.
+        let askGuardHint = ''
+        try {
+          const askGuardMode = resolveAskGuardMode(config, log)
+          if (askGuardMode !== 'off') {
+            const autonomyState = loadAutonomyState(statePaths, args.chat_id, log)
+            const leases = activeLeases(autonomyState, Date.now())
+            if (leases.length > 0) {
+              const analysis = analyzeAskDetailed(args.text, { hasActiveLease: true })
+              // fix-loop #2: a hard-gate marker that survives ONLY inside a
+              // fenced/quoted zone still exempts (fail-safe) but is a distinct
+              // audit class for calibration week.
+              if (analysis.exemptReason === 'hard_gate_protected_only') {
+                log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
+                  code: 'hard_gate_protected_only',
+                  chat_id: args.chat_id,
+                  lease_id: leases[0]!.id,
+                })
+              }
+              const finding = analysis.findings[0]
+              if (finding !== undefined) {
+                const lease = leases[0]! // soonest-expiry first
+                if (askGuardMode === 'block') {
+                  log.info('ask_guard blocked a self-gating permission-ask (mandate active)', {
+                    code: 'ask_guard_block',
+                    chat_id: args.chat_id,
+                    lease_id: lease.id,
+                    pattern: finding.code,
+                  })
+                  // fix-loop #3: list ALL active lease scopes so the model can
+                  // self-check its intended action; never claim authorization.
+                  const scopes = leases.map((l) => l.scope)
+                  return {
+                    content: [{ type: 'text', text: askGuardBlockMessage(lease.id, scopes) }],
+                    isError: true,
+                  }
+                }
+                // advisory — message still ships; attach the hint below.
+                log.info('ask_guard advisory on a self-gating permission-ask (mandate active)', {
+                  code: 'ask_guard_advisory',
+                  chat_id: args.chat_id,
+                  lease_id: lease.id,
+                  pattern: finding.code,
+                })
+                askGuardHint = askGuardAdvisoryHint(lease.id)
+              }
+            }
+          }
+        } catch (err) {
+          // Fail-open: a guard fault must never block a real reply. fix-loop #5
+          // (Codex MED-5): the log call itself is wrapped so a THROWING logger
+          // can never abort delivery from the catch path.
+          try {
+            log.warn('ask_guard evaluation failed — failing open (reply sent unguarded)', {
+              code: 'ask_guard_error',
+              chat_id: args.chat_id,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          } catch {
+            /* a logger fault must not gate a real reply */
+          }
+        }
+
         const files = args.files ?? []
 
         // Resolve every attachment through the workspace gate up front, so a
@@ -377,7 +779,78 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
 
         const sentIds: number[] = []
 
-        if (args.format === 'html') {
+        // ── M1 Rich Messages (Bot API 10.1) ─────────────────────────────
+        // Attempt a single RAW-markdown rich send when ALL conditions hold.
+        // On success we push the id and SKIP the HTML/text+chunk path. On a
+        // transparent `{ fallback: true }` we fall through to the existing
+        // HTML path UNCHANGED — exactly one path ships, so the reply is
+        // never lost or duplicated. A `transient` error re-throws from the
+        // safe wrapper (caught by the outer try) so we never silently
+        // swallow then resend.
+        const richLatch = deps.richLatch
+        // Preserve single newlines: Telegram's rich (raw-markdown) renderer
+        // uses CommonMark, where a lone `\n` is a soft break that collapses
+        // to a space and merges list-like prose lines into one wall of
+        // text. hardenSoftBreaks() promotes those to CommonMark hard breaks
+        // BEFORE the body reaches the safe wrapper's redactor — normalize
+        // → redact → send. It touches only plain-prose boundaries; fenced
+        // code, inline code, tables and paragraph breaks pass through.
+        //
+        // Computed BEFORE the eligibility gate: hardening adds bytes (a `\`
+        // per hardened break), so the size limit must be measured on the
+        // body we actually send, not on the pre-hardened text (review fix —
+        // a 32756-byte input hardened past the 32768 cap and burned a doomed
+        // API call before the transparent fallback).
+        const richBody = hardenSoftBreaks(args.text)
+        // Selective delivery (owner directive 2026-08-29, ported 1:1 from
+        // Hermes v0.20.6): rich is NOT a default mode — it auto-enables only
+        // when the body carries a construct HTML degrades (table, task list,
+        // <details>, block math). Ordinary prose keeps the HTML path so font
+        // weight/spacing stay consistent and the text stays easy to copy.
+        // `format: 'rich'` is NOT an override. The tool schema already says
+        // the explicit value "just forces the same gate", and upstream Hermes
+        // requires _needs_rich_rendering() unconditionally — an escape hatch
+        // that ships prose through rich would reintroduce exactly the copy /
+        // font-weight problem this change removes. (Codex review finding.)
+        const contentWantsRich = needsRichRendering(richBody)
+        // Client-damage shields: both send the body the legacy way rather
+        // than dropping it. details+math crashes Telegram Desktop 6.9.1;
+        // CJK renders with overlapping glyph artifacts on Mac/Desktop.
+        const clientSafeForRich =
+          !hasDetailsMathCrashShape(richBody) && !hasCjkGarbleShape(richBody)
+        const richEligible =
+          config.richMessages.enabled &&
+          args.format !== 'text' &&
+          args.format !== 'markdownv2' &&
+          contentWantsRich &&
+          clientSafeForRich &&
+          richLatch !== undefined &&
+          !richLatch.sendDisabled &&
+          !config.richMessages.perChatOptOut.includes(args.chat_id) &&
+          files.length === 0 &&
+          contentFitsRichLimits(richBody) &&
+          isDmChat(args.chat_id)
+
+        let richSent = false
+        if (richEligible) {
+          const richOpts: SendRichMessageOpts = {}
+          if (replyToId !== undefined) richOpts.reply_to_message_id = replyToId
+          const res = await telegramApi.sendRichMessage(args.chat_id, richBody, richOpts)
+          if ('message_id' in res) {
+            sentIds.push(res.message_id)
+            richSent = true
+          }
+          // else res.fallback === true → fall through to the HTML path below.
+        }
+
+        if (richSent) {
+          // Rich shipped the whole body — nothing else to send for text.
+          // (Attachments are impossible here: richEligible required
+          // files.length === 0.)
+        } else if (args.format === 'html' || args.format === 'rich') {
+          // HTML path (also the fallback for 'rich'): when rich was skipped
+          // (disabled / non-DM / oversize / opted-out / has files) or fell
+          // back transparently, render markdown → validated Telegram HTML.
           // Convert markdown → Telegram HTML, then chunk at 4000 chars so we
           // never exceed Telegram's 4096 sendMessage cap. reply_to applies
           // only to the first chunk so a long answer doesn't quote-spam the
@@ -455,7 +928,40 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result }] }
+
+        // Observe-only TOV/format check (2026-07-09): compute cheap rule-code
+        // metrics on the OUTGOING body and surface them back to the agent as a
+        // hint. NEVER blocking, NEVER rewriting prose, and NEVER logging the
+        // message text — only rule codes + counts. The one deterministic
+        // rewrite (soft-break hardening) already happened above on the rich
+        // path; this is purely advisory feedback so the model self-corrects.
+        //
+        // Guarded (review fix): the message already SHIPPED — a checker throw
+        // here would surface as a tool error and could push the agent into a
+        // duplicate resend. Any failure degrades to "no findings".
+        let hint = ''
+        try {
+          const formatFindings = analyzeFormat(args.text)
+          if (formatFindings.length > 0) {
+            log.info('reply format check', {
+              chat_id: args.chat_id,
+              codes: formatFindings.map((f) => `${f.code}=${f.count}`).join(','),
+            })
+          }
+          hint = formatHint(formatFindings)
+        } catch (err) {
+          log.debug('reply format check failed (ignored)', {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+        // Assemble the tool result: base «sent …» line, plus the ask-guard
+        // advisory hint (M3) when a mandate is active and the body self-gated,
+        // plus the observe-only format hint. Each is optional and independent.
+        const resultParts = [result]
+        if (askGuardHint) resultParts.push(askGuardHint)
+        if (hint) resultParts.push(hint)
+        const resultText = resultParts.join('\n')
+        return { content: [{ type: 'text', text: resultText }] }
       }
 
       case 'react': {
@@ -475,10 +981,29 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = DownloadAttachmentArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
-        try {
-          assertAllowedChat(args.chat_id, config, deps.policy)
-        } catch (err) {
-          return toolError(name, err instanceof Error ? err.message : String(err))
+        if (args.guest_query_id !== undefined) {
+          // Guest Mode path. Authorization = registry membership, NOT the chat
+          // allowlist — the foreign chat is one the bot is not a member of, so
+          // assertAllowedChat would always (correctly) refuse it. Same pattern
+          // as the reply tool's guest branch. hasActiveEntry is non-consuming
+          // (a guest turn may fetch several attachments before its one reply)
+          // and folds in the swapped-pair guard: a live entry whose origin
+          // chat differs from args.chat_id fails the check.
+          if (deps.guestQueries === undefined) {
+            return toolError(name, 'guest downloads unavailable — guest_mode is not enabled in config')
+          }
+          if (!deps.guestQueries.hasActiveEntry(args.guest_query_id, args.chat_id)) {
+            return toolError(
+              name,
+              `guest query ${args.guest_query_id} is not an active guest query for chat ${args.chat_id} — pass the guest_query_id and chat_id from the SAME inbound <channel> meta (guest queries expire after 15 minutes)`,
+            )
+          }
+        } else {
+          try {
+            assertAllowedChat(args.chat_id, config, deps.policy)
+          } catch (err) {
+            return toolError(name, err instanceof Error ? err.message : String(err))
+          }
         }
         const out = await telegramApi.downloadFile(args.file_id, statePaths.inbox)
         return { content: [{ type: 'text', text: out.path }] }
@@ -493,9 +1018,40 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
+        const messageId = Number(args.message_id)
+        // Wave 2: re-render the message richly IN PLACE when its new body
+        // carries a construct the legacy edit degrades. Same gate as the
+        // reply path — content decides, shields veto — so a progress card
+        // that grew a table stops collapsing into bullet lists on every
+        // update. `hardenSoftBreaks` runs first for the same CommonMark
+        // reason as the send path, and the size gate measures what we send.
+        const editRichBody = hardenSoftBreaks(args.text)
+        const editRichEligible =
+          config.richMessages.enabled &&
+          args.format !== 'markdownv2' &&
+          needsRichRendering(editRichBody) &&
+          !hasDetailsMathCrashShape(editRichBody) &&
+          !hasCjkGarbleShape(editRichBody) &&
+          deps.richLatch !== undefined &&
+          !deps.richLatch.sendDisabled &&
+          !config.richMessages.perChatOptOut.includes(args.chat_id) &&
+          contentFitsRichLimits(editRichBody) &&
+          isDmChat(args.chat_id)
+
+        if (editRichEligible) {
+          // A transient failure THROWS out of the safe wrapper on purpose:
+          // the edit may already have landed, so retrying through the legacy
+          // path could fight a successful edit. The outer try turns it into
+          // a tool error. Only an explicit { fallback: true } falls through.
+          const res = await telegramApi.editRichMessage(args.chat_id, messageId, editRichBody)
+          if ('ok' in res) {
+            return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
+          }
+        }
+
         const opts: EditOpts = {}
         if (args.format === 'markdownv2') opts.parse_mode = 'MarkdownV2'
-        await telegramApi.editMessageText(args.chat_id, Number(args.message_id), args.text, opts)
+        await telegramApi.editMessageText(args.chat_id, messageId, args.text, opts)
         return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
       }
 
@@ -545,6 +1101,135 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               : { kind: 'thinking' }
         await statusManager.updateByChatId(args.chat_id, state)
         return { content: [{ type: 'text', text: 'status updated' }] }
+      }
+
+      case 'autonomy': {
+        const parsed = AutonomyArgsSchema.safeParse(rawArgs)
+        if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
+        const args = parsed.data
+        try {
+          assertAllowedChat(args.chat_id, config, deps.policy)
+        } catch (err) {
+          return toolError(name, err instanceof Error ? err.message : String(err))
+        }
+
+        const now = Date.now()
+
+        if (args.action === 'status') {
+          // Read-only — no serialization needed.
+          const state = loadAutonomyState(statePaths, args.chat_id, log)
+          return { content: [{ type: 'text', text: renderAutonomyStatus(state, now) }] }
+        }
+
+        // Honest refusal when a FRESH writer lock is held by another process
+        // (fix-loop-2 #2) — shared by all three mutating actions.
+        const writerConflict = (): CallToolResult =>
+          toolError(
+            name,
+            'autonomy registry is write-locked by another live writer process — mutation refused (writer_conflict), retry later',
+          )
+
+        // A file from a NEWER schema (version > 1) is read-only — refuse the
+        // mutation rather than downgrade + clobber it (PR-1 leftover 4b).
+        const versionUnsupported = (): CallToolResult =>
+          toolError(
+            name,
+            'autonomy registry was written by a newer plugin version — it is read-only, mutation refused (version_unsupported); upgrade the plugin',
+          )
+
+        if (args.action === 'consume') {
+          // lease_id presence is enforced by the schema's superRefine. The
+          // mutation routes through updateAutonomyState — the serialized
+          // read-modify-write — so two concurrent consumes can never both
+          // succeed (fix-loop #1).
+          const leaseId = args.lease_id as string
+          const upd = await updateAutonomyState(
+            statePaths,
+            args.chat_id,
+            (state) => {
+              const r = consumeLease(state, leaseId, now)
+              return { state: r.state, result: r.outcome }
+            },
+            log,
+            now,
+          )
+          if (upd.kind === 'writer_conflict') return writerConflict()
+          if (upd.kind === 'version_unsupported') return versionUnsupported()
+          switch (upd.result) {
+            case 'not_found':
+              return toolError(name, `lease not found: ${leaseId}`)
+            case 'already_consumed':
+              return toolError(name, `lease already consumed: ${leaseId}`)
+            case 'revoked':
+              // Terminal revoked state (fix-loop-2 #4): withdrawn authority
+              // can never be consumed.
+              return toolError(name, `lease revoked: ${leaseId} — the mandate's authority was withdrawn, it cannot be consumed`)
+            case 'expired':
+              // Honest refusal (fix-loop #8): the mandate's window has
+              // passed — do not report success on a dead mandate.
+              return toolError(name, `lease expired: ${leaseId} — the mandate window has passed, it cannot be consumed`)
+            case 'ok':
+              return { content: [{ type: 'text', text: `lease consumed: ${leaseId}` }] }
+          }
+        }
+
+        if (args.action === 'revoke') {
+          // Self-revoke (fix-loop-2 #4): the agent may WITHDRAW its own
+          // authority (revokedBy='agent') — shrinking is safe; granting is not.
+          const leaseId = args.lease_id as string
+          const upd = await updateAutonomyState(
+            statePaths,
+            args.chat_id,
+            (state) => {
+              const r = revokeLease(state, leaseId, now, 'agent', args.reason)
+              return { state: r.state, result: r.outcome }
+            },
+            log,
+            now,
+          )
+          if (upd.kind === 'writer_conflict') return writerConflict()
+          if (upd.kind === 'version_unsupported') return versionUnsupported()
+          switch (upd.result) {
+            case 'not_found':
+              return toolError(name, `lease not found: ${leaseId}`)
+            case 'already_consumed':
+              return toolError(name, `lease already consumed: ${leaseId} — a used mandate cannot be revoked`)
+            case 'already_revoked':
+              return toolError(name, `lease already revoked: ${leaseId}`)
+            case 'expired':
+              return toolError(name, `lease expired: ${leaseId} — an expired mandate has no authority left, nothing to revoke`)
+            case 'ok':
+              return { content: [{ type: 'text', text: `lease revoked: ${leaseId}` }] }
+          }
+        }
+
+        // action === 'resolve_question' (question_id + resolution enforced by schema).
+        const questionId = args.question_id as string
+        const resolution = args.resolution as 'answered' | 'bypassed'
+        const upd: UpdateResult<ReturnType<typeof resolveQuestion>['outcome']> = await updateAutonomyState(
+          statePaths,
+          args.chat_id,
+          (state) => {
+            const r = resolveQuestion(state, questionId, resolution, now)
+            return { state: r.state, result: r.outcome }
+          },
+          log,
+          now,
+        )
+        if (upd.kind === 'writer_conflict') return writerConflict()
+        if (upd.kind === 'version_unsupported') return versionUnsupported()
+        switch (upd.result) {
+          case 'not_found':
+            return toolError(name, `question not found: ${questionId}`)
+          case 'sticky_forbidden':
+            // Store-enforced invariant (fix-loop #2): security questions can
+            // never be bypassed — only an owner answer resolves them.
+            return toolError(name, `question ${questionId} is sticky (security) — bypass is forbidden, it requires the owner's answer`)
+          case 'already_resolved':
+            return toolError(name, `question already resolved: ${questionId}`)
+          case 'ok':
+            return { content: [{ type: 'text', text: `question ${questionId} resolved: ${resolution}` }] }
+        }
       }
 
       default:
