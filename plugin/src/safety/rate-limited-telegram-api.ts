@@ -13,9 +13,15 @@
 //      its bucket. Different chats run in parallel.
 //   2. Global token bucket (default: 25 msg/sec, burst 25). Caps total
 //      throughput across all chats under Telegram's 30/sec bot-wide limit.
-//   3. 429 retry: on a grammY-shaped 429 (`error_code: 429`, optional
-//      `parameters.retry_after`), sleep the requested seconds + a small
-//      jitter and retry the SAME call. Bounded by `maxRetries` (default 3).
+//   3. 429 handling: on a grammY-shaped 429 (`error_code: 429`, optional
+//      `parameters.retry_after`), a SHORT wait (<= MAX_RETRY_AFTER_S) is
+//      slept off with a small jitter and the SAME call is retried, bounded
+//      by `maxRetries` (default 3). A LONG wait is a bot-wide flood-wait
+//      and is never retried — it throws TelegramFloodWaitError with the
+//      real window. See MAX_RETRY_AFTER_S for why retrying makes it worse.
+//   4. Flood-wait breaker: after a long wait is seen, every call is
+//      rejected locally until the window expires, so no request can re-arm
+//      the ban. See `floodWaitUntilMs`.
 //
 // Methods that don't consume the send-bucket: editMessageText (Telegram's
 // edit limits are far more lenient), setMessageReaction, sendChatAction,
@@ -104,25 +110,63 @@ interface Grammy429 {
   parameters?: { retry_after?: number }
 }
 
-// Cap retry_after so one giant value from Telegram (or a hostile-shaped
-// error) can't lock a chat's FIFO queue for minutes on end. The per-chat
-// tail-promise chain blocks all subsequent sends to the same chat until the
-// in-flight op finishes, so worst-case stall = maxRetries × MAX_RETRY_AFTER_S.
-// With defaults (3 × 60s) that's a 3-minute ceiling; if Telegram really
-// needs longer, the bounded retries exhaust and the caller sees the 429.
+// Telegram's 429 comes in two flavours that need opposite handling:
+//
+//   • Burst hiccup — `retry_after` of a few seconds, caused by our own
+//     pacing. Sleeping it off and retrying is correct and stays invisible
+//     to the caller.
+//   • Flood-wait — `retry_after` of minutes to HOURS, imposed on the bot
+//     itself. Requests sent inside that window are not queued, they RE-ARM
+//     the ban: on 2026-08-20 a 20191 s wait on richard's bot became
+//     30710 s after two automatic retries — the retries alone bought ~3
+//     extra hours of silence, and the message was dropped anyway.
+//
+// MAX_RETRY_AFTER_S is the line between the two. At or below it we retry
+// as before. Above it we do NOT touch the API again: we fail fast and hand
+// the caller a TelegramFloodWaitError carrying the true, unclamped wake-up
+// time so it can resend once the window actually opens.
+//
+// This also keeps the per-chat FIFO tail short. The tail blocks every
+// later send to the same chat until the in-flight op finishes, so the
+// worst-case stall stays maxRetries × MAX_RETRY_AFTER_S (3 × 60s = 3 min).
 const MAX_RETRY_AFTER_S = 60
+
+/**
+ * Thrown instead of retrying when Telegram reports a flood-wait longer than
+ * MAX_RETRY_AFTER_S. `error_code` stays 429 so existing 429 checks keep
+ * firing; `retryAfterS` / `windowOpensAtMs` carry the real window so the
+ * caller can schedule a resend instead of guessing.
+ */
+export class TelegramFloodWaitError extends Error {
+  readonly error_code = 429
+  readonly retryAfterS: number
+  readonly windowOpensAtMs: number
+
+  constructor(method: string, retryAfterS: number, windowOpensAtMs: number, cause: unknown) {
+    super(
+      `Telegram flood-wait on ${method}: ${retryAfterS}s remaining, window opens ` +
+        `${new Date(windowOpensAtMs).toISOString()}. Not retried — a retry inside ` +
+        `the window extends the ban. Resend after that time.`,
+      { cause },
+    )
+    this.name = 'TelegramFloodWaitError'
+    this.retryAfterS = retryAfterS
+    this.windowOpensAtMs = windowOpensAtMs
+  }
+}
 
 function parse429(err: unknown): { retryAfter: number } | null {
   if (typeof err !== 'object' || err === null) return null
   const e = err as Grammy429
   if (e.error_code !== 429) return null
   const after = e.parameters?.retry_after
-  // Telegram's retry_after is in seconds. Coerce to a sane positive integer
-  // and clamp into [1, MAX_RETRY_AFTER_S].
+  // Telegram's retry_after is in seconds. Coerce to a sane positive integer.
+  // Deliberately NOT clamped here: withRetry needs the true value to tell a
+  // burst hiccup from a flood-wait, and to report the real window.
   if (typeof after !== 'number' || !Number.isFinite(after) || after < 1) {
     return { retryAfter: 1 }
   }
-  return { retryAfter: Math.min(MAX_RETRY_AFTER_S, Math.ceil(after)) }
+  return { retryAfter: Math.ceil(after) }
 }
 
 export function createRateLimitedTelegramApi(
@@ -146,6 +190,16 @@ export function createRateLimitedTelegramApi(
 
   const globalBucket = makeBucket(cfg.globalBurstCapacity, cfg.globalRefillPerSec, now())
   const chatState = new Map<string, ChatState>()
+
+  // Circuit breaker for a bot-wide flood-wait. While one is in force every
+  // further request RE-ARMS it rather than queueing behind it: on richard's
+  // bot (2026-08-20) five reply attempts spread over 15 minutes each got the
+  // identical `retry_after: 30710` back, so the window never came closer and
+  // the agent would have stayed mute indefinitely. Once we learn a flood-wait
+  // exists we therefore stop talking to Telegram altogether until it expires
+  // and reject locally instead. That silence is what lets the ban run out.
+  // 0 = no flood-wait known.
+  let floodWaitUntilMs = 0
 
   function getChatState(chatId: string): ChatState {
     let s = chatState.get(chatId)
@@ -189,12 +243,37 @@ export function createRateLimitedTelegramApi(
     let lastErr: unknown
     while (true) {
       attempt += 1
+      const suppressedForMs = floodWaitUntilMs - now()
+      if (suppressedForMs > 0) {
+        // Breaker open — do not touch the API, it would only re-arm the ban.
+        const retryAfterS = Math.ceil(suppressedForMs / 1000)
+        log.warn('telegram flood-wait in force, request suppressed', {
+          method,
+          retry_after_s: retryAfterS,
+          window_opens_at: new Date(floodWaitUntilMs).toISOString(),
+        })
+        throw new TelegramFloodWaitError(method, retryAfterS, floodWaitUntilMs, lastErr)
+      }
       try {
         return await op()
       } catch (err) {
         const r = parse429(err)
         if (r === null) throw err
         lastErr = err
+        if (r.retryAfter > MAX_RETRY_AFTER_S) {
+          // Flood-wait, not a burst. Stop here — see MAX_RETRY_AFTER_S — and
+          // open the breaker so nothing else re-arms it. Never shorten a
+          // window we already know about.
+          const windowOpensAtMs = now() + r.retryAfter * 1000
+          floodWaitUntilMs = Math.max(floodWaitUntilMs, windowOpensAtMs)
+          log.warn('telegram flood-wait, not retrying', {
+            method,
+            retry_after_s: r.retryAfter,
+            attempt,
+            window_opens_at: new Date(windowOpensAtMs).toISOString(),
+          })
+          throw new TelegramFloodWaitError(method, r.retryAfter, floodWaitUntilMs, err)
+        }
         if (attempt >= cfg.maxRetries) break
         const jitter =
           cfg.jitterMaxMs > 0 ? Math.floor(Math.random() * cfg.jitterMaxMs) : 0

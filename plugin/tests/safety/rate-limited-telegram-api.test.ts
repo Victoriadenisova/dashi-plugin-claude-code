@@ -19,6 +19,7 @@ import type {
 import type { Logger } from '../../src/log.js'
 import {
   createRateLimitedTelegramApi,
+  TelegramFloodWaitError,
   type RateLimitOptions,
 } from '../../src/safety/rate-limited-telegram-api.js'
 
@@ -91,12 +92,18 @@ interface StubApi {
   // Programmed errors per method/chat. When an error is set, the next
   // matching call throws it and the entry is consumed.
   queueError(method: SentCall['method'], err: Error): void
+  // Times the method was entered, counting attempts that threw. `calls`
+  // only records successes, so this is what proves a retry did (or did
+  // not) happen.
+  attempts(method: SentCall['method']): number
 }
 
 function makeStubApi(clock: FakeClock): StubApi {
   const calls: SentCall[] = []
   const errorQueue: Map<SentCall['method'], Error[]> = new Map()
+  const attemptCount: Map<SentCall['method'], number> = new Map()
   const maybeThrow = (method: SentCall['method']): void => {
+    attemptCount.set(method, (attemptCount.get(method) ?? 0) + 1)
     const list = errorQueue.get(method)
     if (list && list.length > 0) {
       const err = list.shift()
@@ -148,6 +155,9 @@ function makeStubApi(clock: FakeClock): StubApi {
       const list = errorQueue.get(method) ?? []
       list.push(err)
       errorQueue.set(method, list)
+    },
+    attempts(method) {
+      return attemptCount.get(method) ?? 0
     },
   }
 }
@@ -371,17 +381,111 @@ describe('createRateLimitedTelegramApi — 429 retry-after', () => {
 })
 
 describe('createRateLimitedTelegramApi — retry_after clamp & edge values', () => {
-  test('retry_after over 60s is clamped to 60s', async () => {
+  test('retry_after of exactly 60s still retries', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
-    stub.queueError('sendMessage', make429Error(300))
+    stub.queueError('sendMessage', make429Error(60))
     const p = api.sendMessage('100', 'hi', {})
     await flushMicrotasks()
-    // Even though Telegram said 300s, we should retry after 60s.
     await clock.tick(60_000)
     await p
     expect(stub.calls.length).toBe(1)
+  })
+
+  test('retry_after over 60s is a flood-wait: fails fast, never retries', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(30_710))
+    const result = await api.sendMessage('100', 'hi', {}).catch((e: unknown) => e)
+    // Rejected immediately — no sleep, no second request. Retrying inside a
+    // flood-wait window re-arms the ban, which is the bug this guards.
+    expect(result).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.calls.length).toBe(0)
+    expect(stub.attempts('sendMessage')).toBe(1)
+  })
+
+  test('flood-wait error carries the true window and stays 429-shaped', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    const original = make429Error(30_710)
+    stub.queueError('sendMessage', original)
+    const result = (await api
+      .sendMessage('100', 'hi', {})
+      .catch((e: unknown) => e)) as TelegramFloodWaitError
+    // Unclamped seconds, so the caller can schedule a resend...
+    expect(result.retryAfterS).toBe(30_710)
+    expect(result.windowOpensAtMs).toBe(clock.now() + 30_710_000)
+    // ...and downstream `error_code === 429` checks keep working.
+    expect(result.error_code).toBe(429)
+    expect(result.cause).toBe(original)
+  })
+
+  test('breaker: after a flood-wait, later sends are rejected without hitting the API', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(30_710))
+    const first = await api.sendMessage('100', 'first', {}).catch((e: unknown) => e)
+    expect(first).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('sendMessage')).toBe(1)
+
+    const second = await api.sendMessage('100', 'second', {}).catch((e: unknown) => e)
+    expect(second).toBeInstanceOf(TelegramFloodWaitError)
+    // The whole point: the API was never touched again, so nothing re-armed
+    // the ban. Without this, each attempt bought another full window.
+    expect(stub.attempts('sendMessage')).toBe(1)
+    expect(stub.calls.length).toBe(0)
+  })
+
+  test('breaker reports the REMAINING window, not the original grant', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    const openedAt = clock.now()
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'first', {}).catch((e: unknown) => e)
+
+    await clock.tick(10_000_000) // ~2h46m into the window
+    const later = (await api
+      .sendMessage('100', 'second', {})
+      .catch((e: unknown) => e)) as TelegramFloodWaitError
+    expect(later.retryAfterS).toBe(30_710 - 10_000)
+    expect(later.windowOpensAtMs).toBe(openedAt + 30_710_000)
+  })
+
+  test('breaker closes once the window expires and sending resumes', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'first', {}).catch((e: unknown) => e)
+
+    await clock.tick(30_710_000)
+    const resumed = await api.sendMessage('100', 'second', {})
+    expect(resumed.message_id).toBe(1)
+    expect(stub.calls.map((c) => c.text)).toEqual(['second'])
+    expect(stub.attempts('sendMessage')).toBe(2)
+  })
+
+  test('breaker never shortens a window a later, smaller 429 would imply', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'first', {}).catch((e: unknown) => e)
+    const longWindow = clock.now() + 30_710_000
+
+    // Window elapses; a fresh, much shorter flood-wait arrives.
+    await clock.tick(30_710_000)
+    stub.queueError('sendMessage', make429Error(120))
+    const second = (await api
+      .sendMessage('100', 'second', {})
+      .catch((e: unknown) => e)) as TelegramFloodWaitError
+    expect(second.windowOpensAtMs).toBe(clock.now() + 120_000)
+    expect(second.windowOpensAtMs).toBeGreaterThan(longWindow)
   })
 
   test('retry_after = 0 is treated as 1s fallback', async () => {
