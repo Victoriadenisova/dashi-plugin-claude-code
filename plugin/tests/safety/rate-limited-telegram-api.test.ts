@@ -932,7 +932,7 @@ describe('createRateLimitedTelegramApi — hermes pre-merge checks (2026-09-18)'
     expect(suppressed[2]).toMatchObject({ kind: 'suppressed', method: 'sendMessage', count: 5 })
   })
 
-  test('downloadFile (getFile) is suppressed inside a flood-wait and retries a burst 429', async () => {
+  test('downloadFile (getFile) retries a burst 429 and has its own breaker for a long one', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
@@ -947,10 +947,60 @@ describe('createRateLimitedTelegramApi — hermes pre-merge checks (2026-09-18)'
     const later = await api.downloadFile('f', '/tmp').catch((e: unknown) => e)
     expect(later).toBeInstanceOf(TelegramFloodWaitError)
     expect(stub.attempts('downloadFile')).toBe(3)
-    // And a send is blocked by the window getFile earned.
-    const send = await api.sendMessage('100', 'z', {}).catch((e: unknown) => e)
+  })
+
+  // Richard's review of 4d9ba13: a ban on SENDING must not make the agent
+  // deaf to the owner's voice notes and photos for the whole window.
+  test('downloadFile still reaches the API while a send flood-wait is open', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    stub.queueError('sendMessage', make429Error(5000))
+    await api.sendMessage('100', 'a', {}).catch(() => {})
+    const send = await api.sendMessage('100', 'b', {}).catch((e: unknown) => e)
     expect(send).toBeInstanceOf(TelegramFloodWaitError)
-    expect(stub.attempts('sendMessage')).toBe(0)
+    const dl = await api.downloadFile('voice', '/tmp')
+    expect(dl.path).toBe('/tmp/x')
+    expect(stub.attempts('downloadFile')).toBe(1)
+    // The same holds for the photo path (withFloodGuard('getFile')).
+    let n = 0
+    await api.withFloodGuard('getFile', async () => {
+      n += 1
+    })
+    expect(n).toBe(1)
+    // And after a restart inside the send window, downloads still work.
+    const stub2 = makeStubApi(clock)
+    const api2 = createRateLimitedTelegramApi(stub2.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    expect((await api2.downloadFile('voice', '/tmp')).path).toBe('/tmp/x')
+    const send2 = await api2.sendMessage('100', 'c', {}).catch((e: unknown) => e)
+    expect(send2).toBeInstanceOf(TelegramFloodWaitError)
+  })
+
+  test('a long 429 on getFile does not block sends and is not persisted', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      floodWaitStore: store,
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    stub.queueError('downloadFile', make429Error(30_710))
+    await api.downloadFile('f', '/tmp').catch(() => {})
+    expect((await api.sendMessage('100', 'z', {})).message_id).toBe(1)
+    expect(store.attempts.length).toBe(0)
+    // withFloodGuard for a non-getFile method uses the send breaker: untouched.
+    let n = 0
+    await api.withFloodGuard('setMyCommands', async () => {
+      n += 1
+    })
+    expect(n).toBe(1)
+    // The getFile ban itself is journaled with its method.
+    expect(events.map((e) => [e.kind, e.method])).toEqual([['flood_wait', 'getFile']])
+    const dl = await api.downloadFile('f', '/tmp').catch((e: unknown) => e)
+    expect(dl).toBeInstanceOf(TelegramFloodWaitError)
   })
 
   test('default clock is epoch milliseconds, so a persisted window compares across restarts', () => {

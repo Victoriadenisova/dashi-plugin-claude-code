@@ -21,7 +21,7 @@
 //      real window. See MAX_RETRY_AFTER_S for why retrying makes it worse.
 //   4. Flood-wait breaker: after a long wait is seen, every call is
 //      rejected locally until the window expires, so no request can re-arm
-//      the ban. See `floodWaitUntilMs`. The window is persisted through
+//      the ban. See `sendBreaker`. The window is persisted through
 //      `opts.floodWaitStore` so a process restart inside it does not forget
 //      the ban and re-arm it with the first reply (Louis, 2026-09-18: 56483 s).
 //   5. Every 429 (burst retry, flood-wait, local suppression) is reported
@@ -35,11 +35,13 @@
 //
 // Methods that don't consume the send-bucket: editMessageText (Telegram's
 // edit limits are far more lenient), setMessageReaction, sendChatAction,
-// deleteMessage, downloadFile (getFile). They still get the breaker and the
-// 429 retry wrapper so a stray 429 on an edit can recover without the
-// caller seeing it. Only the poller's getUpdates stays outside: it has its
-// own retry_after handling (poller.ts, capped at 10 min) and must keep
-// polling or the channel is deaf.
+// deleteMessage. They still get the send breaker and the 429 retry wrapper
+// so a stray 429 on an edit can recover without the caller seeing it.
+// downloadFile (getFile) has the 429 retry and a SEPARATE breaker: inbound
+// voice and photos must keep working while the bot is banned from sending.
+// Only the poller's getUpdates stays outside: it has its own retry_after
+// handling (poller.ts, capped at 10 min) and must keep polling or the
+// channel is deaf.
 //
 // Clock: `now` is epoch milliseconds (Date.now) — the persisted window is
 // compared against it after a restart, so a monotonic clock would not do.
@@ -215,8 +217,10 @@ export interface RateLimitedTelegramApi extends TelegramApi {
   /**
    * Run an arbitrary Bot API call under the flood-wait breaker and the 429
    * retry policy, without the per-chat send bucket. For calls that are not
-   * on TelegramApi (startup `setMyCommands`, future one-offs). `method` is
-   * the Telegram method name and ends up in the 429 log.
+   * on TelegramApi (startup `setMyCommands`, photo `getFile`, future
+   * one-offs). `method` is the Telegram method name and ends up in the 429
+   * log; `getFile` is routed to the download breaker, everything else to
+   * the send breaker.
    */
   withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T>
 }
@@ -255,11 +259,15 @@ export interface FileFloodWaitStoreOptions {
 
 /**
  * File-backed FloodWaitStore. One small JSON file, written atomically
- * (tmp + fsync + rename + directory fsync) so a crash mid-write cannot leave
- * a half record and a completed save survives power loss, not just a process
- * restart. A missing or corrupt file reads as "no flood-wait known" — never
- * as an error, the channel must start regardless. Single writer by
- * contract: the channel holds bot.pid, so one process owns one state dir.
+ * (tmp + fsync + rename, then a best-effort fsync of the directory) so a
+ * crash mid-write cannot leave a half record. Guarantee: a `true` from
+ * save() survives a process crash unconditionally; it survives power loss
+ * when the filesystem honours directory fsync (ext4/xfs do) — where that
+ * call fails it is ignored and the rename may be lost on power cut, which
+ * is the same outcome as "no flood-wait known". A missing or corrupt file
+ * reads as "no flood-wait known" — never as an error, the channel must
+ * start regardless. Single writer by contract: the channel holds bot.pid,
+ * so one process owns one state dir.
  */
 export function createFileFloodWaitStore(
   path: string,
@@ -481,7 +489,20 @@ export function createRateLimitedTelegramApi(
   // exists we therefore stop talking to Telegram altogether until it expires
   // and reject locally instead. That silence is what lets the ban run out.
   // 0 = no flood-wait known.
-  let floodWaitUntilMs = 0
+  //
+  // Two independent breakers. `send` covers everything that talks TO chats
+  // (messages, edits, reactions, actions, setMyCommands) and is the one
+  // persisted across restarts. `download` covers getFile only: a ban on
+  // sending must not make the agent deaf to the owner's voice notes and
+  // photos for the whole window (Richard's review, 2026-09-18 — 15.7 h that
+  // day), so getFile never reads or writes the send window. It still gets
+  // its own breaker so a long 429 on getFile is not hammered either.
+  interface Breaker {
+    scope: 'send' | 'download'
+    untilMs: number
+  }
+  const sendBreaker: Breaker = { scope: 'send', untilMs: 0 }
+  const downloadBreaker: Breaker = { scope: 'download', untilMs: 0 }
   const store = opts.floodWaitStore
   const emit = (event: RateLimitEvent): void => {
     try {
@@ -559,7 +580,7 @@ export function createRateLimitedTelegramApi(
       })
     }
     if (saved && saved.until_ms > now()) {
-      floodWaitUntilMs = saved.until_ms
+      sendBreaker.untilMs = saved.until_ms
       persistedUntilMs = saved.until_ms
       const remainingS = Math.ceil((saved.until_ms - now()) / 1000)
       log.warn('telegram flood-wait restored from state, suppressing sends', {
@@ -584,6 +605,7 @@ export function createRateLimitedTelegramApi(
   // no count leaks into a later window. chat_id is reported only when every
   // call in the aggregate came from the same chat.
   interface SuppressedAgg {
+    scope: Breaker['scope']
     count: number
     lastReportMs: number
     chatId: string | undefined
@@ -615,19 +637,29 @@ export function createRateLimitedTelegramApi(
     s.mixedChats = false
     s.lastReportMs = now()
   }
-  function flushAllSuppressed(): void {
-    for (const [method, s] of suppressedPending) flushSuppressed(method, s)
-    suppressedPending.clear()
+  function flushScopeSuppressed(scope: Breaker['scope']): void {
+    for (const [method, s] of suppressedPending) {
+      if (s.scope !== scope) continue
+      flushSuppressed(method, s)
+      suppressedPending.delete(method)
+    }
   }
-  function reportSuppressed(method: string, chatId: string | undefined): void {
+  function reportSuppressed(method: string, chatId: string | undefined, breaker: Breaker): void {
     let s = suppressedPending.get(method)
-    if (s && s.windowUntilMs !== floodWaitUntilMs) {
+    if (s && s.windowUntilMs !== breaker.untilMs) {
       // The window was extended: close the old aggregate first.
       flushSuppressed(method, s)
       s = undefined
     }
     if (!s) {
-      s = { count: 0, lastReportMs: -Infinity, chatId: undefined, mixedChats: false, windowUntilMs: floodWaitUntilMs }
+      s = {
+        scope: breaker.scope,
+        count: 0,
+        lastReportMs: -Infinity,
+        chatId: undefined,
+        mixedChats: false,
+        windowUntilMs: breaker.untilMs,
+      }
       suppressedPending.set(method, s)
     }
     if (s.count === 0) s.chatId = chatId
@@ -677,22 +709,23 @@ export function createRateLimitedTelegramApi(
     method: string,
     op: () => Promise<T>,
     chatId?: string,
+    breaker: Breaker = sendBreaker,
   ): Promise<T> {
     let attempt = 0
     let lastErr: unknown
     while (true) {
       attempt += 1
-      const suppressedForMs = floodWaitUntilMs - now()
+      const suppressedForMs = breaker.untilMs - now()
       if (suppressedForMs > 0) {
         // Breaker open — do not touch the API, it would only re-arm the ban.
         const retryAfterS = Math.ceil(suppressedForMs / 1000)
-        reportSuppressed(method, chatId)
-        // A window that never reached disk gets another chance here.
-        persist(null)
-        throw new TelegramFloodWaitError(method, retryAfterS, floodWaitUntilMs, lastErr)
+        reportSuppressed(method, chatId, breaker)
+        // A send window that never reached disk gets another chance here.
+        if (breaker === sendBreaker) persist(null)
+        throw new TelegramFloodWaitError(method, retryAfterS, breaker.untilMs, lastErr)
       }
-      // Breaker closed: whatever was counted during the window goes out now.
-      if (suppressedPending.size > 0) flushAllSuppressed()
+      // Breaker closed: whatever was counted during its window goes out now.
+      if (suppressedPending.size > 0) flushScopeSuppressed(breaker.scope)
       try {
         return await op()
       } catch (err) {
@@ -704,8 +737,8 @@ export function createRateLimitedTelegramApi(
           // open the breaker so nothing else re-arms it. Never shorten a
           // window we already know about.
           const windowOpensAtMs = now() + r.retryAfter * 1000
-          const extended = windowOpensAtMs > floodWaitUntilMs
-          floodWaitUntilMs = Math.max(floodWaitUntilMs, windowOpensAtMs)
+          const extended = windowOpensAtMs > breaker.untilMs
+          breaker.untilMs = Math.max(breaker.untilMs, windowOpensAtMs)
           const windowOpensAt = new Date(windowOpensAtMs).toISOString()
           log.warn('telegram flood-wait, not retrying', {
             method,
@@ -714,17 +747,21 @@ export function createRateLimitedTelegramApi(
             window_opens_at: windowOpensAt,
           })
           emit({ kind: 'flood_wait', method, chat_id: chatId, retry_after_s: r.retryAfter, attempt, window_opens_at: windowOpensAt })
-          persist(
-            extended
-              ? {
-                  until_ms: floodWaitUntilMs,
-                  method,
-                  retry_after_s: r.retryAfter,
-                  seen_at: new Date(now()).toISOString(),
-                }
-              : null,
-          )
-          throw new TelegramFloodWaitError(method, r.retryAfter, floodWaitUntilMs, err)
+          // Only the send window is persisted: a getFile ban is not what
+          // re-arms on restart, and it must never block sends after one.
+          if (breaker === sendBreaker) {
+            persist(
+              extended
+                ? {
+                    until_ms: breaker.untilMs,
+                    method,
+                    retry_after_s: r.retryAfter,
+                    seen_at: new Date(now()).toISOString(),
+                  }
+                : null,
+            )
+          }
+          throw new TelegramFloodWaitError(method, r.retryAfter, breaker.untilMs, err)
         }
         if (attempt >= cfg.maxRetries) break
         const jitter =
@@ -820,10 +857,9 @@ export function createRateLimitedTelegramApi(
     },
 
     async downloadFile(fileId: string, destDir: string): Promise<DownloadResult> {
-      // getFile is a Bot API call like any other: it can earn a 429 and it
-      // re-arms a flood-wait. No send bucket (downloads are not messages),
-      // but the breaker and the 429 retry apply.
-      return withRetry('getFile', () => raw.downloadFile(fileId, destDir))
+      // getFile is a Bot API call, so it gets the 429 retry and a breaker —
+      // its OWN one. A ban on sending must not stop inbound voice and photos.
+      return withRetry('getFile', () => raw.downloadFile(fileId, destDir), undefined, downloadBreaker)
     },
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {
@@ -831,7 +867,7 @@ export function createRateLimitedTelegramApi(
     },
 
     async withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T> {
-      return withRetry(method, op)
+      return withRetry(method, op, undefined, method === 'getFile' ? downloadBreaker : sendBreaker)
     },
   }
 }
