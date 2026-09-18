@@ -429,8 +429,12 @@ const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
 // to forget the ban and re-arm it with the first reply), and every 429 is
 // written with its Telegram method so the call that earned a ban can be
 // found instead of guessed.
+// The window is stamped with the bot id (numeric prefix of the token) so a
+// token swap inside the same state dir cannot inherit another bot's ban.
 const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log, {
-  floodWaitStore: createFileFloodWaitStore(join(statePaths.root, 'flood-wait.json'), log),
+  floodWaitStore: createFileFloodWaitStore(join(statePaths.root, 'flood-wait.json'), log, {
+    botId: env.TELEGRAM_BOT_TOKEN.split(':')[0],
+  }),
   onRateLimitEvent: createJsonlRateLimitEventSink(
     join(statePaths.root, 'logs', 'telegram-429.jsonl'),
     log,
@@ -990,9 +994,15 @@ const handlerDeps: HandlerDeps = {
   telegramApi,
   log,
   bot: botIdentity,
-  // bot.api implements getFile — handlers.ts narrows it to BotApiForDownload
-  // so the media module never reaches into grammY internals.
-  botApi: { api: bot.api },
+  // getFile for photo download goes through the flood-wait breaker and the
+  // 429 retry like every other Bot API call; handlers.ts narrows this to
+  // BotApiForDownload so the media module never reaches into grammY.
+  botApi: {
+    api: {
+      getFile: (fileId: string) =>
+        rateLimitedTelegramApi.withFloodGuard('getFile', () => bot.api.getFile(fileId)),
+    },
+  },
   botToken: env.TELEGRAM_BOT_TOKEN,
   env: env.GROQ_API_KEY !== undefined ? { GROQ_API_KEY: env.GROQ_API_KEY } : {},
   permissionHooks,

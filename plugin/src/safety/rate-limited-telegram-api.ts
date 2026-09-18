@@ -35,14 +35,30 @@
 //
 // Methods that don't consume the send-bucket: editMessageText (Telegram's
 // edit limits are far more lenient), setMessageReaction, sendChatAction,
-// deleteMessage, downloadFile. They still get the 429 retry wrapper so a
-// stray 429 on an edit can recover without the caller seeing it.
+// deleteMessage, downloadFile (getFile). They still get the breaker and the
+// 429 retry wrapper so a stray 429 on an edit can recover without the
+// caller seeing it. Only the poller's getUpdates stays outside: it has its
+// own retry_after handling (poller.ts, capped at 10 min) and must keep
+// polling or the channel is deaf.
+//
+// Clock: `now` is epoch milliseconds (Date.now) — the persisted window is
+// compared against it after a restart, so a monotonic clock would not do.
 //
 // Test seams: `opts.now` and `opts.sleep` replace the real clock and
 // setTimeout-based sleep, so tests can run instantly with deterministic
 // virtual time.
 
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import {
+  appendFileSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeSync,
+} from 'fs'
 import { dirname } from 'path'
 import type { Logger } from '../log.js'
 import type {
@@ -135,13 +151,32 @@ export interface FloodWaitRecord {
   retry_after_s: number
   /** ISO timestamp of the 429. */
   seen_at: string
+  /**
+   * Bot the window belongs to (numeric prefix of the token). A record from
+   * a different bot in the same state dir is ignored on load.
+   */
+  bot_id?: string
 }
 
 export interface FloodWaitStore {
   /** Returns the last saved record, or null when none / unreadable. */
   load(): FloodWaitRecord | null
-  save(record: FloodWaitRecord): void
+  /** Returns true only when the record is durably written. */
+  save(record: FloodWaitRecord): boolean
 }
+
+// A save that failed (ENOSPC, permissions) is retried on the next 429-related
+// event, but not more often than this — the failure will not fix itself in
+// a millisecond and each attempt logs a warning.
+const PERSIST_RETRY_MS = 30_000
+// Suppressed requests inside a window are coalesced: one journal line and
+// one warning per interval carrying the count, instead of one per call.
+// A stuck agent can retry every few seconds for hours.
+const SUPPRESSED_REPORT_INTERVAL_MS = 30_000
+// The 429 journal is rotated once (to `<path>.1`) past this size.
+const JOURNAL_ROTATE_BYTES = 5 * 1024 * 1024
+// A failing file write is reported once per minute, not once per event.
+const FS_WARN_INTERVAL_MS = 60_000
 
 export type RateLimitEvent =
   | {
@@ -166,6 +201,8 @@ export type RateLimitEvent =
       chat_id?: string | undefined
       retry_after_s: number
       window_opens_at: string
+      /** Suppressed calls this line stands for (coalesced per interval). */
+      count: number
     }
   | {
       kind: 'restored'
@@ -184,13 +221,41 @@ export interface RateLimitedTelegramApi extends TelegramApi {
   withFloodGuard<T>(method: string, op: () => Promise<T>): Promise<T>
 }
 
+// Warn about a failing file at most once per FS_WARN_INTERVAL_MS. A full or
+// read-only disk would otherwise turn every 429 into a warning line.
+function makeThrottledWarn(log: Logger, msg: string, path: string): (err: unknown) => void {
+  let lastWarnMs = 0
+  return (err: unknown): void => {
+    const t = Date.now()
+    if (t - lastWarnMs < FS_WARN_INTERVAL_MS) return
+    lastWarnMs = t
+    log.warn(msg, { path, error: err instanceof Error ? err.message : String(err) })
+  }
+}
+
+export interface FileFloodWaitStoreOptions {
+  /**
+   * Bot the state belongs to (numeric prefix of the token). Stamped on save;
+   * a record carrying a different bot_id is ignored on load, so swapping the
+   * token inside the same TELEGRAM_STATE_DIR cannot inherit another bot's
+   * ban. Omit to skip the check.
+   */
+  botId?: string | undefined
+}
+
 /**
  * File-backed FloodWaitStore. One small JSON file, written atomically
- * (tmp + rename) so a crash mid-write cannot leave a half record. A missing
- * or corrupt file reads as "no flood-wait known" — never as an error, the
- * channel must start regardless.
+ * (tmp + fsync + rename) so a crash mid-write cannot leave a half record. A
+ * missing or corrupt file reads as "no flood-wait known" — never as an
+ * error, the channel must start regardless. Single writer by contract: the
+ * channel holds bot.pid, so one process owns one state dir.
  */
-export function createFileFloodWaitStore(path: string, log: Logger): FloodWaitStore {
+export function createFileFloodWaitStore(
+  path: string,
+  log: Logger,
+  storeOpts: FileFloodWaitStoreOptions = {},
+): FloodWaitStore {
+  const warnWrite = makeThrottledWarn(log, 'flood-wait state file write failed', path)
   return {
     load(): FloodWaitRecord | null {
       let raw: string
@@ -211,11 +276,24 @@ export function createFileFloodWaitStore(path: string, log: Logger): FloodWaitSt
           log.warn('flood-wait state file malformed, ignoring', { path })
           return null
         }
+        const botId = typeof v.bot_id === 'string' ? v.bot_id : undefined
+        if (storeOpts.botId !== undefined && botId !== undefined && botId !== storeOpts.botId) {
+          log.warn('flood-wait state file belongs to another bot, ignoring', {
+            path,
+            file_bot_id: botId,
+            bot_id: storeOpts.botId,
+          })
+          return null
+        }
         return {
           until_ms: v.until_ms,
           method: v.method,
-          retry_after_s: typeof v.retry_after_s === 'number' ? v.retry_after_s : 0,
+          retry_after_s:
+            typeof v.retry_after_s === 'number' && Number.isFinite(v.retry_after_s)
+              ? v.retry_after_s
+              : 0,
           seen_at: typeof v.seen_at === 'string' ? v.seen_at : '',
+          ...(botId !== undefined ? { bot_id: botId } : {}),
         }
       } catch (err) {
         log.warn('flood-wait state file unreadable, ignoring', {
@@ -225,18 +303,26 @@ export function createFileFloodWaitStore(path: string, log: Logger): FloodWaitSt
         return null
       }
     },
-    save(record: FloodWaitRecord): void {
+    save(record: FloodWaitRecord): boolean {
+      const stamped: FloodWaitRecord =
+        storeOpts.botId !== undefined ? { ...record, bot_id: storeOpts.botId } : record
+      const tmp = `${path}.tmp-${process.pid}`
       try {
         mkdirSync(dirname(path), { recursive: true })
-        const tmp = `${path}.tmp-${process.pid}`
-        writeFileSync(tmp, JSON.stringify(record) + '\n', { mode: 0o600 })
+        const fd = openSync(tmp, 'w', 0o600)
+        try {
+          writeSync(fd, JSON.stringify(stamped) + '\n')
+          fsyncSync(fd)
+        } finally {
+          closeSync(fd)
+        }
         renameSync(tmp, path)
+        return true
       } catch (err) {
         // Losing persistence is bad but must not turn a 429 into a crash.
-        log.warn('flood-wait state file write failed', {
-          path,
-          error: err instanceof Error ? err.message : String(err),
-        })
+        // The caller keeps the record dirty and retries later.
+        warnWrite(err)
+        return false
       }
     },
   }
@@ -245,11 +331,15 @@ export function createFileFloodWaitStore(path: string, log: Logger): FloodWaitSt
 /**
  * JSONL sink for RateLimitEvent: one line per event, `ts` first. Append-only
  * so a ban can be traced back to the exact method and time afterwards.
+ * Rotated once to `<path>.1` past JOURNAL_ROTATE_BYTES; the previous `.1`
+ * is dropped. Writes go to the file only — never to stdout, which is the
+ * MCP transport.
  */
 export function createJsonlRateLimitEventSink(
   path: string,
   log: Logger,
 ): (event: RateLimitEvent) => void {
+  const warnWrite = makeThrottledWarn(log, 'telegram 429 log write failed', path)
   let dirReady = false
   return (event: RateLimitEvent): void => {
     try {
@@ -257,14 +347,18 @@ export function createJsonlRateLimitEventSink(
         mkdirSync(dirname(path), { recursive: true })
         dirReady = true
       }
+      let size = 0
+      try {
+        size = statSync(path).size
+      } catch {
+        size = 0
+      }
+      if (size >= JOURNAL_ROTATE_BYTES) renameSync(path, `${path}.1`)
       appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n', {
         mode: 0o600,
       })
     } catch (err) {
-      log.warn('telegram 429 log write failed', {
-        path,
-        error: err instanceof Error ? err.message : String(err),
-      })
+      warnWrite(err)
     }
   }
 }
@@ -375,14 +469,52 @@ export function createRateLimitedTelegramApi(
     }
   }
 
+  // Persistence is best-effort per attempt but not fire-and-forget: the
+  // window the store last acknowledged is tracked, and while memory is
+  // ahead of it (a save failed, or threw) the record stays dirty and is
+  // retried on the next 429-related event, at most once per
+  // PERSIST_RETRY_MS. In-memory state always advances regardless.
+  let persistedUntilMs = 0
+  let lastPersistAttemptMs = -Infinity
+  let pendingRecord: FloodWaitRecord | null = null
+  function persist(record: FloodWaitRecord | null): void {
+    if (!store) return
+    if (record) pendingRecord = record
+    if (!pendingRecord || pendingRecord.until_ms <= persistedUntilMs) return
+    const t = now()
+    if (t - lastPersistAttemptMs < PERSIST_RETRY_MS) return
+    lastPersistAttemptMs = t
+    let ok = false
+    try {
+      ok = store.save(pendingRecord) === true
+    } catch (err) {
+      log.warn('flood-wait store save threw', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    if (ok) {
+      persistedUntilMs = pendingRecord.until_ms
+      pendingRecord = null
+    }
+  }
+
   // Restore a window that outlived the previous process. Without this a
   // restart inside the ban forgets it, and the very next reply re-arms the
   // full window. An expired record is ignored (and left on disk; the next
-  // flood-wait overwrites it).
+  // flood-wait overwrites it). A store that throws on load is treated as
+  // empty — the channel must start regardless.
   if (store) {
-    const saved = store.load()
+    let saved: FloodWaitRecord | null = null
+    try {
+      saved = store.load()
+    } catch (err) {
+      log.warn('flood-wait store load threw, starting without a window', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
     if (saved && saved.until_ms > now()) {
       floodWaitUntilMs = saved.until_ms
+      persistedUntilMs = saved.until_ms
       const remainingS = Math.ceil((saved.until_ms - now()) / 1000)
       log.warn('telegram flood-wait restored from state, suppressing sends', {
         method: saved.method,
@@ -397,6 +529,28 @@ export function createRateLimitedTelegramApi(
         window_opens_at: new Date(saved.until_ms).toISOString(),
       })
     }
+  }
+
+  // Suppressed calls are coalesced per method: the first one in an interval
+  // is reported at once, the rest are counted and flushed with the next
+  // report. Keeps the journal readable when an agent retries in a loop.
+  const suppressedPending = new Map<string, { count: number; lastReportMs: number }>()
+  function reportSuppressed(method: string, chatId: string | undefined, retryAfterS: number, windowOpensAt: string): void {
+    const t = now()
+    const s = suppressedPending.get(method) ?? { count: 0, lastReportMs: -Infinity }
+    s.count += 1
+    if (t - s.lastReportMs >= SUPPRESSED_REPORT_INTERVAL_MS) {
+      log.warn('telegram flood-wait in force, request suppressed', {
+        method,
+        retry_after_s: retryAfterS,
+        window_opens_at: windowOpensAt,
+        count: s.count,
+      })
+      emit({ kind: 'suppressed', method, chat_id: chatId, retry_after_s: retryAfterS, window_opens_at: windowOpensAt, count: s.count })
+      s.count = 0
+      s.lastReportMs = t
+    }
+    suppressedPending.set(method, s)
   }
 
   function getChatState(chatId: string): ChatState {
@@ -450,12 +604,9 @@ export function createRateLimitedTelegramApi(
         // Breaker open — do not touch the API, it would only re-arm the ban.
         const retryAfterS = Math.ceil(suppressedForMs / 1000)
         const windowOpensAt = new Date(floodWaitUntilMs).toISOString()
-        log.warn('telegram flood-wait in force, request suppressed', {
-          method,
-          retry_after_s: retryAfterS,
-          window_opens_at: windowOpensAt,
-        })
-        emit({ kind: 'suppressed', method, chat_id: chatId, retry_after_s: retryAfterS, window_opens_at: windowOpensAt })
+        reportSuppressed(method, chatId, retryAfterS, windowOpensAt)
+        // A window that never reached disk gets another chance here.
+        persist(null)
         throw new TelegramFloodWaitError(method, retryAfterS, floodWaitUntilMs, lastErr)
       }
       try {
@@ -479,14 +630,16 @@ export function createRateLimitedTelegramApi(
             window_opens_at: windowOpensAt,
           })
           emit({ kind: 'flood_wait', method, chat_id: chatId, retry_after_s: r.retryAfter, attempt, window_opens_at: windowOpensAt })
-          if (extended && store) {
-            store.save({
-              until_ms: floodWaitUntilMs,
-              method,
-              retry_after_s: r.retryAfter,
-              seen_at: new Date(now()).toISOString(),
-            })
-          }
+          persist(
+            extended
+              ? {
+                  until_ms: floodWaitUntilMs,
+                  method,
+                  retry_after_s: r.retryAfter,
+                  seen_at: new Date(now()).toISOString(),
+                }
+              : null,
+          )
           throw new TelegramFloodWaitError(method, r.retryAfter, floodWaitUntilMs, err)
         }
         if (attempt >= cfg.maxRetries) break
@@ -583,7 +736,10 @@ export function createRateLimitedTelegramApi(
     },
 
     async downloadFile(fileId: string, destDir: string): Promise<DownloadResult> {
-      return raw.downloadFile(fileId, destDir)
+      // getFile is a Bot API call like any other: it can earn a 429 and it
+      // re-arms a flood-wait. No send bucket (downloads are not messages),
+      // but the breaker and the 429 retry apply.
+      return withRetry('getFile', () => raw.downloadFile(fileId, destDir))
     },
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {

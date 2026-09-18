@@ -596,17 +596,28 @@ describe('createRateLimitedTelegramApi — pass-through methods', () => {
 
 function memoryStore(initial: FloodWaitRecord | null = null): FloodWaitStore & {
   saved: FloodWaitRecord[]
+  // Set to true to make save() report failure (disk full); the record is
+  // still recorded in `attempts` so tests can count retries.
+  failing: boolean
+  attempts: FloodWaitRecord[]
 } {
   const saved: FloodWaitRecord[] = []
+  const attempts: FloodWaitRecord[] = []
   let current = initial
-  return {
+  const store = {
     saved,
+    attempts,
+    failing: false,
     load: () => current,
-    save: (r) => {
+    save: (r: FloodWaitRecord): boolean => {
+      attempts.push(r)
+      if (store.failing) return false
       current = r
       saved.push(r)
+      return true
     },
   }
+  return store
 }
 
 describe('createRateLimitedTelegramApi — flood-wait survives restart', () => {
@@ -725,6 +736,7 @@ describe('createRateLimitedTelegramApi — 429 journal carries the method', () =
         chat_id: '8',
         retry_after_s: 30_710,
         window_opens_at: new Date(3000 + 30_710_000).toISOString(),
+        count: 1,
       },
     ])
   })
@@ -781,6 +793,176 @@ describe('createRateLimitedTelegramApi — withFloodGuard for calls outside Tele
   })
 })
 
+describe('createRateLimitedTelegramApi — hermes pre-merge checks (2026-09-18)', () => {
+  test('guard runs again after a burst sleep: a window opened meanwhile stops the retry before it hits the API', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    // Chat A: burst 429, sleeps 5 s before retrying.
+    stub.queueError('sendMessage', make429Error(5))
+    const a = api.sendMessage('A', 'a', {}).catch((e: unknown) => e)
+    await flushMicrotasks()
+    expect(stub.attempts('sendMessage')).toBe(1)
+    // Chat B, during A's sleep: flood-wait opens the breaker.
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('B', 'b', {}).catch(() => {})
+    expect(stub.attempts('sendMessage')).toBe(2)
+    // A wakes up: must NOT call the API again.
+    await clock.tick(5000)
+    const result = await a
+    expect(result).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('sendMessage')).toBe(2)
+  })
+
+  test('queued sends behind a flood-wait are suppressed one by one without any API call', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(30_710))
+    const results = await Promise.all(
+      ['1', '2', '3'].map((t) => api.sendMessage('100', t, {}).catch((e: unknown) => e)),
+    )
+    expect(results.every((r) => r instanceof TelegramFloodWaitError)).toBe(true)
+    expect(stub.attempts('sendMessage')).toBe(1)
+  })
+
+  test('a store whose load() throws does not stop the channel from starting and sending', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      floodWaitStore: {
+        load: () => {
+          throw new Error('disk on fire')
+        },
+        save: () => true,
+      },
+    })
+    expect((await api.sendMessage('100', 'ok', {})).message_id).toBe(1)
+  })
+
+  test('a store whose save() throws does not change the flood-wait outcome, and the window stays in memory', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      floodWaitStore: {
+        load: () => null,
+        save: () => {
+          throw new Error('EROFS')
+        },
+      },
+    })
+    stub.queueError('sendMessage', make429Error(30_710))
+    const first = await api.sendMessage('100', 'a', {}).catch((e: unknown) => e)
+    expect(first).toBeInstanceOf(TelegramFloodWaitError)
+    const second = await api.sendMessage('100', 'b', {}).catch((e: unknown) => e)
+    expect(second).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('sendMessage')).toBe(1)
+  })
+
+  test('a failed save is retried on later 429 events, at most once per 30 s, until it lands', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    store.failing = true
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'a', {}).catch(() => {})
+    expect(store.attempts.length).toBe(1)
+    expect(store.saved.length).toBe(0)
+    // Immediate suppressed calls do not hammer the disk.
+    await api.sendMessage('100', 'b', {}).catch(() => {})
+    await api.sendMessage('100', 'c', {}).catch(() => {})
+    expect(store.attempts.length).toBe(1)
+    // 30 s later: one more attempt, still failing.
+    await clock.tick(30_000)
+    await api.sendMessage('100', 'd', {}).catch(() => {})
+    expect(store.attempts.length).toBe(2)
+    expect(store.saved.length).toBe(0)
+    // Disk back: the next window passes and the ORIGINAL record lands.
+    store.failing = false
+    await clock.tick(30_000)
+    await api.sendMessage('100', 'e', {}).catch(() => {})
+    expect(store.saved.length).toBe(1)
+    expect(store.saved[0]).toMatchObject({ until_ms: 30_710_000, method: 'sendMessage', retry_after_s: 30_710 })
+    // Once persisted, nothing more is written.
+    await clock.tick(30_000)
+    await api.sendMessage('100', 'f', {}).catch(() => {})
+    expect(store.attempts.length).toBe(3)
+  })
+
+  test('a restored window is not re-saved; a longer one seen later is', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore({ until_ms: 1_000_000, method: 'sendMessage', retry_after_s: 1000, seen_at: '' })
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    await api.sendMessage('100', 'a', {}).catch(() => {})
+    expect(store.attempts.length).toBe(0)
+    await clock.tick(1_000_000)
+    stub.queueError('sendMessage', make429Error(5000))
+    await api.sendMessage('100', 'b', {}).catch(() => {})
+    expect(store.saved.length).toBe(1)
+    expect(store.saved[0]?.until_ms).toBe(1_000_000 + 5_000_000)
+  })
+
+  test('suppressed calls are coalesced: one event per method per 30 s carrying the count', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const events: RateLimitEvent[] = []
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, {
+      ...defaultOpts(clock),
+      onRateLimitEvent: (e) => events.push(e),
+    })
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('100', 'a', {}).catch(() => {})
+    // Different chats: the per-chat bucket (burst 3) must not be what stops them.
+    for (let i = 0; i < 5; i += 1) await api.sendMessage(`c${i}`, 'x', {}).catch(() => {})
+    await api.sendChatAction('100', 'typing').catch(() => {})
+    let suppressed = events.filter((e) => e.kind === 'suppressed')
+    // First suppressed of each method reported at once, the other 4 sends counted.
+    expect(suppressed.map((e) => [e.method, (e as { count: number }).count])).toEqual([
+      ['sendMessage', 1],
+      ['sendChatAction', 1],
+    ])
+    await clock.tick(30_000)
+    await api.sendMessage('c9', 'y', {}).catch(() => {})
+    suppressed = events.filter((e) => e.kind === 'suppressed')
+    expect(suppressed.length).toBe(3)
+    expect(suppressed[2]).toMatchObject({ kind: 'suppressed', method: 'sendMessage', count: 5 })
+  })
+
+  test('downloadFile (getFile) is suppressed inside a flood-wait and retries a burst 429', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('downloadFile', make429Error(2))
+    const p = api.downloadFile('f', '/tmp')
+    await flushMicrotasks()
+    await clock.tick(2000)
+    expect((await p).path).toBe('/tmp/x')
+    expect(stub.attempts('downloadFile')).toBe(2)
+    stub.queueError('downloadFile', make429Error(30_710))
+    await api.downloadFile('f', '/tmp').catch(() => {})
+    const later = await api.downloadFile('f', '/tmp').catch((e: unknown) => e)
+    expect(later).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('downloadFile')).toBe(3)
+    // And a send is blocked by the window getFile earned.
+    const send = await api.sendMessage('100', 'z', {}).catch((e: unknown) => e)
+    expect(send).toBeInstanceOf(TelegramFloodWaitError)
+    expect(stub.attempts('sendMessage')).toBe(0)
+  })
+
+  test('default clock is epoch milliseconds, so a persisted window compares across restarts', () => {
+    const stub = makeStubApi(new FakeClock())
+    const store = memoryStore({ until_ms: Date.now() + 60_000, method: 'sendMessage', retry_after_s: 60, seen_at: '' })
+    const events: RateLimitEvent[] = []
+    createRateLimitedTelegramApi(stub.api, stubLog, { floodWaitStore: store, onRateLimitEvent: (e) => events.push(e) })
+    expect(events[0]?.kind).toBe('restored')
+    expect((events[0] as { retry_after_s: number }).retry_after_s).toBeLessThanOrEqual(60)
+  })
+})
+
 describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real files', () => {
   test('save then load round-trips; missing and corrupt files read as null', () => {
     const dir = mkdtempSync(join(tmpdir(), 'floodwait-'))
@@ -798,11 +980,31 @@ describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real file
     expect(store.load()).toBeNull()
   })
 
+  test('save reports success, stamps bot_id, and a record from another bot is ignored on load', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'floodwait-'))
+    const path = join(dir, 'flood-wait.json')
+    const mine = createFileFloodWaitStore(path, stubLog, { botId: '111' })
+    expect(mine.save({ until_ms: 5, method: 'sendMessage', retry_after_s: 1, seen_at: 't' })).toBe(true)
+    expect(mine.load()).toMatchObject({ until_ms: 5, bot_id: '111' })
+    const other = createFileFloodWaitStore(path, stubLog, { botId: '222' })
+    expect(other.load()).toBeNull()
+    // No bot id configured: the record is accepted whoever wrote it.
+    expect(createFileFloodWaitStore(path, stubLog).load()).toMatchObject({ until_ms: 5 })
+  })
+
+  test('save returns false instead of throwing when the path cannot be written', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'floodwait-'))
+    const blocker = join(dir, 'not-a-dir')
+    writeFileSync(blocker, 'x')
+    const store = createFileFloodWaitStore(join(blocker, 'flood-wait.json'), stubLog)
+    expect(store.save({ until_ms: 5, method: 'sendMessage', retry_after_s: 1, seen_at: 't' })).toBe(false)
+  })
+
   test('sink appends one JSON line per event with ts first and creates the directory', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tg429-'))
     const path = join(dir, 'logs', 'telegram-429.jsonl')
     const sink = createJsonlRateLimitEventSink(path, stubLog)
-    sink({ kind: 'suppressed', method: 'sendMessage', chat_id: '1', retry_after_s: 5, window_opens_at: 'w' })
+    sink({ kind: 'suppressed', method: 'sendMessage', chat_id: '1', retry_after_s: 5, window_opens_at: 'w', count: 1 })
     sink({ kind: 'burst_retry', method: 'sendPhoto', retry_after_s: 2, attempt: 1, wait_ms: 2000 })
     const lines = readFileSync(path, 'utf8').trim().split('\n')
     expect(lines.length).toBe(2)
@@ -810,5 +1012,17 @@ describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real file
     expect(Object.keys(first)[0]).toBe('ts')
     expect(first).toMatchObject({ kind: 'suppressed', method: 'sendMessage', chat_id: '1' })
     expect(JSON.parse(lines[1] as string)).toMatchObject({ kind: 'burst_retry', method: 'sendPhoto' })
+  })
+
+  test('sink rotates the journal once to .1 past 5 MB', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tg429-'))
+    const path = join(dir, 'telegram-429.jsonl')
+    writeFileSync(path, 'x'.repeat(5 * 1024 * 1024))
+    const sink = createJsonlRateLimitEventSink(path, stubLog)
+    sink({ kind: 'restored', method: 'sendMessage', retry_after_s: 1, window_opens_at: 'w' })
+    expect(existsSync(`${path}.1`)).toBe(true)
+    const lines = readFileSync(path, 'utf8').trim().split('\n')
+    expect(lines.length).toBe(1)
+    expect(JSON.parse(lines[0] as string)).toMatchObject({ kind: 'restored' })
   })
 })
