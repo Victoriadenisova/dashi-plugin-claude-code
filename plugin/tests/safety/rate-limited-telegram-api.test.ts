@@ -27,7 +27,7 @@ import {
   type RateLimitEvent,
   type RateLimitOptions,
 } from '../../src/safety/rate-limited-telegram-api.js'
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -1151,6 +1151,58 @@ describe('createRateLimitedTelegramApi — hermes static review of 4d9ba13', () 
   })
 })
 
+describe('createRateLimitedTelegramApi — independent review of 4d9ba13/5ee41fe (Opus)', () => {
+  test('retry timer is never lost: a second failed save while a timer is pending, then throttle, still lands', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const store = memoryStore()
+    store.failing = true
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, { ...defaultOpts(clock), floodWaitStore: store })
+    // An op in flight BEFORE any window exists (so the breaker lets it out).
+    let reject!: (e: unknown) => void
+    const inflight = api
+      .withFloodGuard('setMyCommands', () => new Promise<void>((_, r) => { reject = r }))
+      .catch(() => {})
+    await flushMicrotasks()
+    // t=0: window A, save fails → timer @30 s.
+    stub.queueError('sendMessage', make429Error(30_710))
+    await api.sendMessage('A', 'a', {}).catch(() => {})
+    expect(store.attempts.length).toBe(1)
+    // t=29 s: the in-flight op returns a longer 429; its save fails too;
+    // scheduleRetry is a no-op because a timer is already pending.
+    await clock.tick(29_000)
+    reject(make429Error(56_483))
+    await inflight
+    expect(store.attempts.map((r) => r.until_ms)).toEqual([30_710_000, 29_000 + 56_483_000])
+    // t=30 s: timer fires, throttled (1 s since last attempt) → must reschedule.
+    store.failing = false
+    await clock.tick(1_000)
+    expect(store.saved.length).toBe(0)
+    // Ten minutes of silence, healthy disk, no calls: the LONGER record lands.
+    await clock.tick(600_000)
+    expect(store.saved.map((r) => r.until_ms)).toEqual([29_000 + 56_483_000])
+  })
+
+  test('a TelegramFloodWaitError thrown by a nested guarded op propagates unchanged, without a 1 s burst retry', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('downloadFile', make429Error(30_710))
+    await api.downloadFile('f', '/tmp').catch(() => {})
+    let outerCalls = 0
+    const result = await api
+      .withFloodGuard('setMyCommands', async () => {
+        outerCalls += 1
+        return api.downloadFile('f', '/tmp')
+      })
+      .catch((e: unknown) => e)
+    expect(result).toBeInstanceOf(TelegramFloodWaitError)
+    expect(outerCalls).toBe(1)
+    // The send breaker was not opened by the inner download ban.
+    expect((await api.sendMessage('100', 'ok', {})).message_id).toBe(1)
+  })
+})
+
 describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real files', () => {
   test('save then load round-trips; missing and corrupt files read as null', () => {
     const dir = mkdtempSync(join(tmpdir(), 'floodwait-'))
@@ -1200,6 +1252,21 @@ describe('createFileFloodWaitStore / createJsonlRateLimitEventSink — real file
     expect(Object.keys(first)[0]).toBe('ts')
     expect(first).toMatchObject({ kind: 'suppressed', method: 'sendMessage', chat_id: '1' })
     expect(JSON.parse(lines[1] as string)).toMatchObject({ kind: 'burst_retry', method: 'sendPhoto' })
+  })
+
+  test('a failing rotation does not blind the journal: the event is still appended', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tg429-'))
+    const path = join(dir, 'telegram-429.jsonl')
+    writeFileSync(path, 'x'.repeat(5 * 1024 * 1024))
+    // `.1` is a non-empty directory, so rename onto it fails.
+    mkdirSync(`${path}.1`)
+    writeFileSync(join(`${path}.1`, 'keep'), 'y')
+    const warned: string[] = []
+    const sink = createJsonlRateLimitEventSink(path, { ...stubLog, warn: (m) => warned.push(m) })
+    sink({ kind: 'restored', method: 'sendMessage', retry_after_s: 1, window_opens_at: 'w' })
+    const content = readFileSync(path, 'utf8')
+    expect(content.endsWith('"window_opens_at":"w"}\n')).toBe(true)
+    expect(warned).toEqual(['telegram 429 log rotation failed'])
   })
 
   test('sink rotates the journal once to .1 past 5 MB', () => {

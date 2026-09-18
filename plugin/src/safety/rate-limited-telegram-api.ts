@@ -372,6 +372,7 @@ export function createJsonlRateLimitEventSink(
   log: Logger,
 ): (event: RateLimitEvent) => void {
   const warnWrite = makeThrottledWarn(log, 'telegram 429 log write failed', path)
+  const warnRotate = makeThrottledWarn(log, 'telegram 429 log rotation failed', path)
   let dirReady = false
   return (event: RateLimitEvent): void => {
     try {
@@ -379,13 +380,13 @@ export function createJsonlRateLimitEventSink(
         mkdirSync(dirname(path), { recursive: true })
         dirReady = true
       }
-      let size = 0
+      // Rotation is best-effort and separate from the append: a rename that
+      // keeps failing (EXDEV, permissions) must not blind the journal.
       try {
-        size = statSync(path).size
-      } catch {
-        size = 0
+        if (statSync(path).size >= JOURNAL_ROTATE_BYTES) renameSync(path, `${path}.1`)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') warnRotate(err)
       }
-      if (size >= JOURNAL_ROTATE_BYTES) renameSync(path, `${path}.1`)
       appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n', {
         mode: 0o600,
       })
@@ -526,6 +527,15 @@ export function createRateLimitedTelegramApi(
   let lastPersistAttemptMs = -Infinity
   let pendingRecord: FloodWaitRecord | null = null
   let retryScheduled = false
+  // Production timer is unref'd so a pending persist retry cannot hold the
+  // process open at shutdown; tests inject `sleep` and drive it themselves.
+  const retryTimer =
+    opts.sleep ??
+    ((ms: number): Promise<void> =>
+      new Promise((r) => {
+        const t = setTimeout(r, ms)
+        t.unref?.()
+      }))
   function trySave(record: FloodWaitRecord): boolean {
     lastPersistAttemptMs = now()
     try {
@@ -540,7 +550,8 @@ export function createRateLimitedTelegramApi(
   function scheduleRetry(): void {
     if (retryScheduled) return
     retryScheduled = true
-    void sleep(PERSIST_RETRY_MS).then(() => {
+    const delay = Math.max(0, PERSIST_RETRY_MS - (now() - lastPersistAttemptMs))
+    void retryTimer(delay).then(() => {
       retryScheduled = false
       persist(null)
     })
@@ -556,7 +567,12 @@ export function createRateLimitedTelegramApi(
       return
     }
     const isRetry = record === null
-    if (isRetry && now() - lastPersistAttemptMs < PERSIST_RETRY_MS) return
+    if (isRetry && now() - lastPersistAttemptMs < PERSIST_RETRY_MS) {
+      // Too soon to hit the disk again — but never drop the record: make
+      // sure a timer will come back for it (idempotent).
+      scheduleRetry()
+      return
+    }
     if (trySave(pendingRecord)) {
       persistedUntilMs = pendingRecord.until_ms
       pendingRecord = null
@@ -729,6 +745,10 @@ export function createRateLimitedTelegramApi(
       try {
         return await op()
       } catch (err) {
+        // A guarded op nested inside another guarded op: the inner wrapper
+        // already handled the 429 and opened its breaker. Propagate as is —
+        // re-parsing it as a 1 s burst would sleep and retry the outer op.
+        if (err instanceof TelegramFloodWaitError) throw err
         const r = parse429(err)
         if (r === null) throw err
         lastErr = err

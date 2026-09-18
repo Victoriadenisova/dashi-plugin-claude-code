@@ -431,9 +431,12 @@ const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
 // found instead of guessed.
 // The window is stamped with the bot id (numeric prefix of the token) so a
 // token swap inside the same state dir cannot inherit another bot's ban.
+// Only a well-formed token yields an id: a malformed one must never end up
+// stamped into the state file or a log line as a whole.
+const floodWaitBotId = /^(\d{5,}):/.exec(env.TELEGRAM_BOT_TOKEN)?.[1]
 const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log, {
   floodWaitStore: createFileFloodWaitStore(join(statePaths.root, 'flood-wait.json'), log, {
-    botId: env.TELEGRAM_BOT_TOKEN.split(':')[0],
+    botId: floodWaitBotId,
   }),
   onRateLimitEvent: createJsonlRateLimitEventSink(
     join(statePaths.root, 'logs', 'telegram-429.jsonl'),
